@@ -83,6 +83,93 @@ resolve_token() {
   fi
 }
 
+# ── Qualcomm hardware SDK stack (run on every node) ───────────────────────────
+# The Rubik Pi 3 Ubuntu base image ships three pre-configured apt repositories:
+#   apt.thundercomm.com/rubik-pi-3/noble   — board-specific / Thundercomm packages
+#   tangshan.archive.canonical.com          — Canonical Qualcomm Ubuntu archive
+#   ppa:ubuntu-qcom-iot/qcom-ppa            — Qualcomm IoT PPA
+# These repos provide the Adreno driver, FastRPC, GStreamer Qualcomm plugins,
+# QNN, and SNPE packages.  The install step below just makes sure the relevant
+# packages are actually installed on every node (they are not all in the default
+# minimal image).
+install_qcom_hw_stack() {
+  step "Installing Qualcomm hardware SDK stack"
+
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+
+  # ── Linux firmware ─────────────────────────────────────────────────────────
+  # Required for GPU (Adreno), NPU (Hexagon HTP), and VPU (msm_vidc) firmware
+  # blobs to be loaded by the kernel at device initialisation time.
+  apt-get install -y -qq linux-firmware || true
+
+  # ── Qualcomm AI inference SDKs ─────────────────────────────────────────────
+  # QNN (Qualcomm Neural Network) — provides backends for HTP (NPU Hexagon),
+  # GPU, DSP, and CPU inference.  Required by any workload using the NPU.
+  # SNPE (Snapdragon Neural Processing Engine) — older SDK, still used by many
+  # existing models and by GStreamer's mlsnpe plugin.
+  apt-get install -y -qq \
+    libqnn1 libqnn-dev qnn-tools \
+    libsnpe1 libsnpe-dev snpe-tools
+
+  # ── Adreno GPU OpenCL ICD ──────────────────────────────────────────────────
+  # Provides libOpenCL_adreno.so, libadreno_utils.so, and the adreno.icd
+  # entry that the OCL ICD loader uses to enumerate the Adreno GPU platform.
+  apt-get install -y -qq qcom-adreno1 || true
+
+  # ── FastRPC userspace libraries ────────────────────────────────────────────
+  # libcdsprpc.so / libadsprpc.so — needed to open RPC sessions to CDSP
+  # (Hexagon NPU/CDSP) and ADSP from userspace.  The kernel-side daemons
+  # (cdsprpcd, adsprpcd) are pre-installed; ensure the userspace libs match.
+  # qcom-property-vault — provides libpropertyvault.so which the Adreno OCL
+  # ICD uses for Android-style system properties on Linux.
+  apt-get install -y -qq \
+    qcom-fastrpc1 qcom-fastrpc-dev \
+    qcom-property-vault || true
+
+  # ── Ensure FastRPC daemons are enabled and running ─────────────────────────
+  # cdsprpcd handles CDSP (Hexagon 790 HTP/compute DSP).
+  # adsprpcd handles ADSP (audio/sensor DSP).
+  # Both must be running before any QNN HTP or FastRPC ioctl calls.
+  systemctl enable --now cdsprpcd 2>/dev/null || true
+  systemctl enable --now adsprpcd 2>/dev/null || true
+  log "FastRPC daemons enabled (cdsprpcd, adsprpcd)"
+
+  # ── CPU OpenCL via POCL ────────────────────────────────────────────────────
+  # POCL provides a full OpenCL 3.0 implementation on the ARM CPU, useful for
+  # testing OpenCL kernels without a GPU driver.
+  # ocl-icd-opencl-dev / opencl-headers — needed to compile OpenCL programs.
+  apt-get install -y -qq \
+    pocl-opencl-icd \
+    ocl-icd-opencl-dev \
+    opencl-headers \
+    opencl-clhpp-headers \
+    clinfo
+
+  # ── V4L2 / GStreamer tools ─────────────────────────────────────────────────
+  # v4l-utils — v4l2-ctl, v4l2-compliance: inspect and test video devices
+  #              (msm_vidc VPU encoder at /dev/video32-33).
+  # gstreamer1.0-tools + plugins-bad — gst-launch-1.0 pipeline tool and the
+  #   v4l2h264enc element used to drive the VPU from scripts/containers.
+  # The Qualcomm GStreamer plugins (gstreamer1.0-plugins-qcom-*) are already
+  # pre-installed by the Thundercomm/Tangshan repos in the base image.
+  apt-get install -y -qq \
+    v4l-utils \
+    gstreamer1.0-tools \
+    gstreamer1.0-plugins-bad
+
+  # ── C++ build toolchain ────────────────────────────────────────────────────
+  # Required to compile the hw_bench C++ benchmark on the node itself.
+  # cmake ≥ 3.16, g++13, libdrm-dev for DRM/KMS device queries.
+  apt-get install -y -qq \
+    cmake \
+    build-essential \
+    g++ \
+    libdrm-dev
+
+  log "Qualcomm hardware SDK stack installed"
+}
+
 # ── System preparation (run on every node before RKE2) ────────────────────────
 prepare_system() {
   step "Preparing system"
@@ -668,8 +755,9 @@ main() {
   echo
 
   check_firmware
-  prepare_system    # swap, kernel modules, sysctl, NetworkManager, UFW
-  install_prereqs   # helm
+  install_qcom_hw_stack   # QNN, SNPE, Adreno OCL, FastRPC, POCL, V4L2, build tools
+  prepare_system          # swap, kernel modules, sysctl, NetworkManager, UFW
+  install_prereqs         # helm
 
   if [[ -z "$CLUSTER_SERVER" ]]; then
     echo -e "  ${BOLD}Mode: INIT${NC} — bootstrapping a new cluster"

@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/hw_bench.dir/src/main.cpp.o CMakeFiles/hw_bench.dir/src/dmabuf.cpp.o CMakeFiles/hw_bench.dir/src/ocl_bench.cpp.o CMakeFiles/hw_bench.dir/src/qnn_runner.cpp.o CMakeFiles/hw_bench.dir/src/vpu_codec.cpp.o CMakeFiles/hw_bench.dir/src/fastrpc_probe.cpp.o -o hw_bench  -lOpenCL -ldl -lpthread /usr/lib/aarch64-linux-gnu/libOpenCL.so -ldl -lpthread 
