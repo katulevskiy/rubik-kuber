@@ -72,13 +72,32 @@ generate_token() {
   fi
 }
 
+# Read the active cluster token — prefer the server-written token file which is
+# what RKE2 actually uses at runtime, fall back to generating a new one.
+resolve_token() {
+  local server_token_file="${RKE2_DATA_DIR}/server/token"
+  if [[ -f "$server_token_file" ]]; then
+    cat "$server_token_file"
+  else
+    generate_token
+  fi
+}
+
 # ── System preparation (run on every node before RKE2) ────────────────────────
 prepare_system() {
   step "Preparing system"
 
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq curl openssl
+  # open-iscsi + iscsid: required by Longhorn for block storage
+  # nfs-common: required by Longhorn for backup NFS targets
+  # util-linux: provides findmnt/blkid used by Longhorn
+  apt-get install -y -qq curl openssl open-iscsi nfs-common util-linux
+
+  # Enable iscsid — Longhorn requires it to be running on every node
+  systemctl enable iscsid 2>/dev/null || true
+  systemctl start  iscsid 2>/dev/null || true
+  log "iSCSI daemon enabled and started"
 
   # ── Swap ──
   # Kubernetes requires swap off for predictable resource management
@@ -86,24 +105,22 @@ prepare_system() {
     info "Disabling swap..."
     swapoff -a
   fi
-  # Comment out any swap entries in fstab so they survive reboots
   sed -i.bak 's|^\([^#].*\s\+swap\s.*\)$|# \1|g' /etc/fstab
   log "Swap disabled"
 
   # ── Kernel modules ──
-  # overlay: required by containerd for OverlayFS storage driver
-  # br_netfilter: required for bridged traffic to pass through iptables
-  modprobe overlay    2>/dev/null || warn "modprobe overlay failed (may already be built-in)"
+  modprobe overlay      2>/dev/null || warn "modprobe overlay failed (may already be built-in)"
   modprobe br_netfilter 2>/dev/null || warn "modprobe br_netfilter failed"
+  modprobe iscsi_tcp    2>/dev/null || warn "modprobe iscsi_tcp failed (Longhorn may still work)"
 
   cat > /etc/modules-load.d/k8s.conf <<'EOF'
 overlay
 br_netfilter
+iscsi_tcp
 EOF
   log "Kernel modules configured"
 
   # ── Sysctl ──
-  # Required for Kubernetes networking (bridged traffic + IP forwarding)
   cat > /etc/sysctl.d/k8s.conf <<'EOF'
 net.bridge.bridge-nf-call-iptables  = 1
 net.bridge.bridge-nf-call-ip6tables = 1
@@ -113,8 +130,6 @@ EOF
   log "Sysctl networking settings applied"
 
   # ── NetworkManager ──
-  # Prevent NetworkManager from managing CNI-created interfaces (cni0,
-  # flannel.1, veth*) which would disrupt pod networking.
   if systemctl is-active --quiet NetworkManager 2>/dev/null; then
     mkdir -p /etc/NetworkManager/conf.d
     cat > /etc/NetworkManager/conf.d/rke2-cni.conf <<'EOF'
@@ -126,19 +141,18 @@ EOF
   fi
 
   # ── UFW firewall ──
-  # Only add rules if UFW is active — don't force-enable it
   if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
     info "Configuring UFW rules for RKE2..."
-    ufw allow 6443/tcp  comment 'RKE2 Kubernetes API server'  2>/dev/null
-    ufw allow 9345/tcp  comment 'RKE2 supervisor API (node join)'  2>/dev/null
-    ufw allow 10250/tcp comment 'Kubelet metrics'  2>/dev/null
-    ufw allow 8472/udp  comment 'RKE2 Canal/Flannel VXLAN overlay'  2>/dev/null
-    ufw allow 2379/tcp  comment 'etcd client (server nodes)'  2>/dev/null
-    ufw allow 2380/tcp  comment 'etcd peer (server nodes)'  2>/dev/null
-    ufw allow 7946/tcp  comment 'MetalLB memberlist'  2>/dev/null
-    ufw allow 7946/udp  comment 'MetalLB memberlist'  2>/dev/null
-    ufw allow 80/tcp    comment 'HTTP ingress (Traefik)'  2>/dev/null
-    ufw allow 443/tcp   comment 'HTTPS ingress (Traefik)'  2>/dev/null
+    ufw allow 6443/tcp  comment 'RKE2 Kubernetes API server'      2>/dev/null
+    ufw allow 9345/tcp  comment 'RKE2 supervisor API (node join)' 2>/dev/null
+    ufw allow 10250/tcp comment 'Kubelet metrics'                 2>/dev/null
+    ufw allow 8472/udp  comment 'RKE2 Canal/Flannel VXLAN'        2>/dev/null
+    ufw allow 2379/tcp  comment 'etcd client'                     2>/dev/null
+    ufw allow 2380/tcp  comment 'etcd peer'                       2>/dev/null
+    ufw allow 7946/tcp  comment 'MetalLB memberlist'              2>/dev/null
+    ufw allow 7946/udp  comment 'MetalLB memberlist'              2>/dev/null
+    ufw allow 80/tcp    comment 'HTTP ingress (Traefik)'          2>/dev/null
+    ufw allow 443/tcp   comment 'HTTPS ingress (Traefik)'         2>/dev/null
     ufw reload 2>/dev/null || true
     log "UFW rules configured"
   else
@@ -163,14 +177,12 @@ install_prereqs() {
 setup_kubectl() {
   step "Setting up kubectl"
 
-  # Symlink RKE2's bundled kubectl into PATH
   if [[ ! -e /usr/local/bin/kubectl ]]; then
     ln -sf "${RKE2_KUBECTL}" /usr/local/bin/kubectl
   fi
 
   export KUBECONFIG="$KUBECONFIG_PATH"
 
-  # Propagate kubeconfig to ubuntu user
   local home_dir
   home_dir=$(getent passwd ubuntu 2>/dev/null | cut -d: -f6 || echo "/home/ubuntu")
   if [[ -d "$home_dir" ]]; then
@@ -212,7 +224,9 @@ wait_for_lb_ip() {
   local svc="$1"
   local ns="$2"
   local max="${3:-24}"   # 2 min
-  info "Waiting for LoadBalancer IP on ${ns}/${svc}..."
+  # All diagnostic output goes to stderr so callers can safely capture stdout
+  # to get just the IP address without ANSI codes contaminating it.
+  info "Waiting for LoadBalancer IP on ${ns}/${svc}..." >&2
   local i ip
   for i in $(seq 1 "$max"); do
     ip=$("$RKE2_KUBECTL" get svc "$svc" -n "$ns" \
@@ -221,10 +235,10 @@ wait_for_lb_ip() {
       echo "$ip"
       return 0
     fi
-    echo -n "."
+    echo -n "." >&2
     sleep 5
   done
-  echo
+  echo >&2
   return 1
 }
 
@@ -268,21 +282,19 @@ install_rke2() {
 }
 
 # ── Helm chart installs (init node only) ───────────────────────────────────────
+# All installs use `helm upgrade --install` so re-runs are fully idempotent.
+
 install_metallb() {
   local range="$1"
   step "Installing MetalLB"
 
-  if "$RKE2_KUBECTL" get deployment -n metallb-system controller &>/dev/null; then
-    log "MetalLB already installed"
-  else
-    helm repo add metallb https://metallb.github.io/metallb --force-update 2>/dev/null
-    helm repo update metallb 2>/dev/null
-    helm install metallb metallb/metallb \
-      --namespace metallb-system \
-      --create-namespace \
-      --wait \
-      --timeout 5m
-  fi
+  helm repo add metallb https://metallb.github.io/metallb --force-update 2>/dev/null
+  helm repo update metallb 2>/dev/null
+  helm upgrade --install metallb metallb/metallb \
+    --namespace metallb-system \
+    --create-namespace \
+    --wait \
+    --timeout 5m
 
   info "Configuring MetalLB IP pool: ${range}"
   "$RKE2_KUBECTL" apply -f - <<EOF
@@ -311,15 +323,10 @@ EOF
 install_traefik() {
   step "Installing Traefik"
 
-  if "$RKE2_KUBECTL" get deployment -n traefik traefik &>/dev/null; then
-    log "Traefik already installed"
-    return
-  fi
-
   helm repo add traefik https://traefik.github.io/charts --force-update 2>/dev/null
   helm repo update traefik 2>/dev/null
 
-  helm install traefik traefik/traefik \
+  helm upgrade --install traefik traefik/traefik \
     --namespace traefik \
     --create-namespace \
     --wait \
@@ -329,8 +336,7 @@ install_traefik() {
     --set "ingressClass.enabled=true" \
     --set "ingressClass.isDefaultClass=true" \
     --set "providers.kubernetesIngress.publishedService.enabled=true" \
-    --set "logs.general.level=INFO" \
-    --set "ports.web.redirectTo.port=websecure"
+    --set "logs.general.level=INFO"
 
   log "Traefik installed"
 }
@@ -338,15 +344,10 @@ install_traefik() {
 install_cert_manager() {
   step "Installing cert-manager"
 
-  if "$RKE2_KUBECTL" get deployment -n cert-manager cert-manager &>/dev/null; then
-    log "cert-manager already installed"
-    return
-  fi
-
   helm repo add jetstack https://charts.jetstack.io --force-update 2>/dev/null
   helm repo update jetstack 2>/dev/null
 
-  helm install cert-manager jetstack/cert-manager \
+  helm upgrade --install cert-manager jetstack/cert-manager \
     --namespace cert-manager \
     --create-namespace \
     --set crds.enabled=true \
@@ -360,25 +361,28 @@ install_rancher() {
   local node_ip="$1"
   step "Installing Rancher"
 
-  if "$RKE2_KUBECTL" get deployment -n cattle-system rancher &>/dev/null; then
-    log "Rancher already installed"
-    return
+  # Get Traefik's LoadBalancer IP to construct the nip.io hostname.
+  # If already installed, read the persisted hostname instead of waiting again.
+  local rancher_hostname=""
+  if [[ -f "${RKE2_CONFIG_DIR}/rancher-hostname" ]]; then
+    rancher_hostname=$(cat "${RKE2_CONFIG_DIR}/rancher-hostname")
+    log "Using existing Rancher hostname: ${rancher_hostname}"
+  else
+    local traefik_ip
+    traefik_ip=$(wait_for_lb_ip traefik traefik) || {
+      warn "Could not obtain Traefik LoadBalancer IP — falling back to node IP"
+      traefik_ip="$node_ip"
+    }
+    rancher_hostname="rancher.${traefik_ip}.nip.io"
+    echo "$rancher_hostname" > "${RKE2_CONFIG_DIR}/rancher-hostname"
   fi
 
-  # Get Traefik's LoadBalancer IP to construct the nip.io hostname
-  local traefik_ip
-  traefik_ip=$(wait_for_lb_ip traefik traefik) || {
-    warn "Could not obtain Traefik LoadBalancer IP — falling back to node IP"
-    traefik_ip="$node_ip"
-  }
-
-  local rancher_hostname="rancher.${traefik_ip}.nip.io"
   log "Rancher hostname: ${rancher_hostname}"
 
   helm repo add rancher-stable https://releases.rancher.com/server-charts/stable --force-update 2>/dev/null
   helm repo update rancher-stable 2>/dev/null
 
-  helm install rancher rancher-stable/rancher \
+  helm upgrade --install rancher rancher-stable/rancher \
     --namespace cattle-system \
     --create-namespace \
     --set "hostname=${rancher_hostname}" \
@@ -390,34 +394,35 @@ install_rancher() {
     --wait \
     --timeout 10m
 
-  # Persist hostname for the summary
-  echo "$rancher_hostname" > "${RKE2_CONFIG_DIR}/rancher-hostname"
   log "Rancher installed at https://${rancher_hostname}"
+}
+
+install_longhorn() {
+  step "Installing Longhorn (distributed block storage)"
+
+  helm repo add longhorn https://charts.longhorn.io --force-update 2>/dev/null
+  helm repo update longhorn 2>/dev/null
+
+  # defaultReplicaCount=1: required for single-node — Longhorn won't schedule
+  # volumes with replica count > number of nodes.
+  helm upgrade --install longhorn longhorn/longhorn \
+    --namespace longhorn-system \
+    --create-namespace \
+    --wait \
+    --timeout 10m \
+    --set "persistence.defaultClass=true" \
+    --set "persistence.defaultClassReplicaCount=1" \
+    --set "defaultSettings.defaultReplicaCount=1" \
+    --set "defaultSettings.storageMinimalAvailablePercentage=10"
+
+  log "Longhorn installed — default StorageClass: longhorn"
 }
 
 remove_control_plane_taints() {
   step "Removing control-plane taints"
-  # RKE2 server nodes are untainted by default, but remove any that may have
-  # been applied by Kubernetes itself (control-plane, master).
-  # The trailing '-' on the taint key means "remove".
   "$RKE2_KUBECTL" taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || true
   "$RKE2_KUBECTL" taint nodes --all node-role.kubernetes.io/master-        2>/dev/null || true
   log "Control-plane taints cleared (nodes are schedulable)"
-}
-
-set_default_storageclass() {
-  step "Setting local-path as default StorageClass"
-  # RKE2 bundles local-path-provisioner but doesn't mark it as default.
-  # Rancher and many Helm charts require a default StorageClass for PVCs.
-  local sc
-  sc=$("$RKE2_KUBECTL" get storageclass local-path --no-headers 2>/dev/null | awk '{print $1}' || true)
-  if [[ -n "$sc" ]]; then
-    "$RKE2_KUBECTL" patch storageclass local-path \
-      -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
-    log "local-path StorageClass set as default"
-  else
-    warn "local-path StorageClass not found — skipping (Rancher PVCs may need manual storage setup)"
-  fi
 }
 
 install_device_plugin() {
@@ -464,12 +469,18 @@ install_init() {
   fi
   log "MetalLB IP range: ${METALLB_RANGE}"
 
+  # Resolve token: use the running cluster's token if RKE2 is already up,
+  # otherwise generate a fresh one. This ensures re-runs print the correct token.
   local token
-  token=$(generate_token)
+  token=$(resolve_token)
 
-  step "Writing RKE2 server config (init node)"
-  mkdir -p "$RKE2_CONFIG_DIR"
-  cat > "${RKE2_CONFIG_DIR}/config.yaml" <<EOF
+  # Only write (or re-write) the RKE2 config when the server is not yet running.
+  # Re-writing it while running would replace the token with a newly generated
+  # one, which would make the join command printed at the end incorrect.
+  if ! systemctl is-active --quiet rke2-server 2>/dev/null; then
+    step "Writing RKE2 server config (init node)"
+    mkdir -p "$RKE2_CONFIG_DIR"
+    cat > "${RKE2_CONFIG_DIR}/config.yaml" <<EOF
 # RKE2 init node — generated by rubik-kubernetes installer
 cluster-init: true
 token: "${token}"
@@ -481,21 +492,24 @@ tls-san:
   - "${node_ip}"
   - "$(hostname -f 2>/dev/null || hostname)"
 EOF
+  else
+    log "RKE2 already running — preserving existing config"
+  fi
 
   install_rke2 "server"
   setup_kubectl
 
-  local hostname
-  hostname=$(hostname)
-  wait_for_node_ready "$hostname"
+  local node_hostname
+  node_hostname=$(hostname)
+  wait_for_node_ready "$node_hostname"
 
   remove_control_plane_taints
-  set_default_storageclass
 
   # Helm charts (only on init node)
   install_metallb "$METALLB_RANGE"
   install_traefik
   install_cert_manager
+  install_longhorn
   install_rancher "$node_ip"
   install_device_plugin
   apply_session_rbac
@@ -512,16 +526,16 @@ install_join() {
   log "Node IP: ${node_ip}"
   log "Joining: ${CLUSTER_SERVER}  (role: ${CLUSTER_ROLE})"
 
-  # Warn about etcd quorum for server joins
   if [[ "$CLUSTER_ROLE" == "server" ]]; then
     warn "Joining as server (control plane + etcd member)."
     warn "Keep total server count odd (1, 3, 5) for etcd quorum."
     warn "For pure workers (no etcd), re-run with CLUSTER_ROLE=agent"
   fi
 
-  step "Writing RKE2 ${CLUSTER_ROLE} config"
-  mkdir -p "$RKE2_CONFIG_DIR"
-  cat > "${RKE2_CONFIG_DIR}/config.yaml" <<EOF
+  if ! systemctl is-active --quiet "rke2-${CLUSTER_ROLE}" 2>/dev/null; then
+    step "Writing RKE2 ${CLUSTER_ROLE} config"
+    mkdir -p "$RKE2_CONFIG_DIR"
+    cat > "${RKE2_CONFIG_DIR}/config.yaml" <<EOF
 # RKE2 join node — generated by rubik-kubernetes installer
 server: "${CLUSTER_SERVER}"
 token: "${CLUSTER_TOKEN}"
@@ -530,6 +544,9 @@ tls-san:
   - "${node_ip}"
   - "$(hostname -f 2>/dev/null || hostname)"
 EOF
+  else
+    log "RKE2 already running — preserving existing config"
+  fi
 
   local rke2_type
   [[ "$CLUSTER_ROLE" == "agent" ]] && rke2_type="agent" || rke2_type="server"
@@ -537,7 +554,6 @@ EOF
   install_rke2 "$rke2_type"
   setup_kubectl
 
-  # Wait for the local RKE2 service to be healthy
   step "Verifying node is healthy"
   local i
   for i in $(seq 1 60); do
@@ -585,6 +601,11 @@ print_init_summary() {
     echo -e "  (Accept the self-signed certificate in your browser)"
     echo
   fi
+
+  echo -e "  ${BOLD}Longhorn storage UI${NC}"
+  echo -e "  Run: ${BLUE}kubectl port-forward -n longhorn-system svc/longhorn-frontend 8080:80${NC}"
+  echo -e "  Then open: ${BLUE}http://localhost:8080${NC}"
+  echo
 
   echo -e "  ${BOLD}Add more nodes — run this command on each Pi:${NC}"
   echo
