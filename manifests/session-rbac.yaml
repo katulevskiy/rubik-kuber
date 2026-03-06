@@ -1,0 +1,64 @@
+# Interactive Session RBAC
+#
+# Creates the "sessions" namespace (with privileged Pod Security Admission)
+# and the RBAC objects needed to manage session pods.
+#
+# The "session-manager" ClusterRole allows:
+#   - Creating / deleting / exec-ing into pods in the sessions namespace
+#   - Listing nodes (so session.sh can pick a target node)
+#
+# Bind additional users/service accounts to this ClusterRole as needed.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sessions
+  labels:
+    # Allow privileged pods — required for hardware-enabled session containers
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit:   privileged
+    pod-security.kubernetes.io/warn:    privileged
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: session-manager
+  namespace: sessions
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: session-manager
+rules:
+  # Manage session pods
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # Exec into running pods (used by session.sh connect)
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  # Stream pod logs
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # List nodes (for session scheduling / display in session list)
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: session-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: session-manager
+subjects:
+  - kind: ServiceAccount
+    name: session-manager
+    namespace: sessions
