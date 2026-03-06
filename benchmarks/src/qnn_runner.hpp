@@ -1,12 +1,13 @@
 #pragma once
 #include "common.hpp"
 
-// Run QNN MatMul inference on each available QNN backend:
-//   • libQnnCpu.so   — ARM CPU via QNN (quantised reference)
-//   • libQnnHtp.so   — Hexagon HTP (NPU / AI Engine)
-//   • libQnnDsp.so   — Hexagon DSP (CDSP, general compute)
-//   • libQnnGpu.so   — Adreno GPU via QNN (compare w/ raw OpenCL)
+// Run QNN MatMul inference on each available QNN backend.
+// Each backend tests a different piece of silicon with a matrix size chosen
+// to amortise that hardware's fixed dispatch overhead:
 //
-// Each test builds a single MatMul op graph (N×N float32),
-// executes it, and verifies correctness vs. CPU reference.
-void run_qnn_benchmarks(int matmul_n = 64);
+//   QNN-CPU  (libQnnCpu.so)  — ARM CPU,        64×64 float32
+//   QNN-HTP  (libQnnHtp.so)  — Hexagon HTP/NPU, 512×512 float32
+//   QNN-GPU  (libQnnGpu.so)  — Adreno 643L GPU, 128×128 float32
+//
+// libQnnDsp.so (legacy ADSP compute) is excluded — not supported on QCS6490.
+void run_qnn_benchmarks();

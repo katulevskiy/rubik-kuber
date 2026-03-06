@@ -7,6 +7,8 @@
 #include <QnnLog.h>
 
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
@@ -22,11 +24,58 @@ typedef Qnn_ErrorHandle_t (*QnnLogCreate_t)(QnnLog_Callback_t, QnnLog_Level_t, Q
 #define QNN_IFACE(p) ((p)->v2_30)
 
 // ── Quiet log callback ────────────────────────────────────────────────────────
+// Silences QNN's own log-callback system (structured logging).
 static void qnn_log_cb(const char* /*fmt*/, QnnLog_Level_t lvl,
                        uint64_t /*stamp*/, va_list /*ap*/) {
-    // Suppress all QNN internal logging — only our own messages are shown.
     (void)lvl;
 }
+
+// ── Library noise filter ──────────────────────────────────────────────────────
+// QNN backend shared libraries (libQnnHtp.so, libQnnHtpPrepare.so,
+// libxdsprpc.so, rpcmem) emit verbose diagnostics directly via printf/fprintf
+// to BOTH stdout and stderr, bypassing the QNN log callback entirely.  Examples:
+//   <W> Initializing HtpProvider
+//   rpcmem_android.c:38: dummy call to rpcmem_init ...
+//   <W> Sanitizing the value for hvx_threads and setting to default
+//   ====== DDR bandwidth summary ======
+//   <W> m_CFBCallbackInfoObj is not initialized, return emptyList
+// We redirect BOTH fd 1 (stdout) and fd 2 (stderr) to /dev/null for the
+// duration of QNN backend calls, then restore them before our own output.
+struct LibNoiseFilter {
+    int saved_out;
+    int saved_err;
+
+    explicit LibNoiseFilter() : saved_out(-1), saved_err(-1) {
+        fflush(stdout);
+        fflush(stderr);
+        saved_out = dup(STDOUT_FILENO);
+        saved_err = dup(STDERR_FILENO);
+        int nul = open("/dev/null", O_WRONLY);
+        if (nul >= 0) {
+            dup2(nul, STDOUT_FILENO);
+            dup2(nul, STDERR_FILENO);
+            close(nul);
+        }
+    }
+
+    // Idempotent — safe to call explicitly before the destructor runs.
+    void restore() {
+        if (saved_out >= 0) {
+            fflush(stdout);
+            dup2(saved_out, STDOUT_FILENO);
+            close(saved_out);
+            saved_out = -1;
+        }
+        if (saved_err >= 0) {
+            fflush(stderr);
+            dup2(saved_err, STDERR_FILENO);
+            close(saved_err);
+            saved_err = -1;
+        }
+    }
+
+    ~LibNoiseFilter() { restore(); }
+};
 
 // ── Reference CPU MatMul ──────────────────────────────────────────────────────
 static void ref_matmul(const float* A, const float* B, float* C, int N) {
@@ -39,24 +88,35 @@ static void ref_matmul(const float* A, const float* B, float* C, int N) {
 }
 
 // ── Build + execute a single-MatMul graph on a QNN backend ──────────────────
-static bool run_backend(const char*  lib_path,
-                        const char*  display_name,
-                        int          N,
-                        const float* h_A,
-                        const float* h_B,
-                        const float* h_Cref)
+static bool run_backend(const char* lib_path,
+                        const char* display_name,
+                        int         N)
 {
+    // Generate inputs and reference output for this backend's matrix size.
+    std::vector<float> h_A(N*N), h_B(N*N), h_Cref(N*N, 0.0f);
+    for (int i = 0; i < N*N; i++) {
+        h_A[i] = (float)(i % 13) * 0.1f;
+        h_B[i] = (float)(i % 7)  * 0.1f;
+    }
+    ref_matmul(h_A.data(), h_B.data(), h_Cref.data(), N);
+
+    // Redirect both stdout and stderr to /dev/null for the lifetime of this
+    // backend.  QNN libraries emit verbose diagnostics directly to fd 1/2.
+    LibNoiseFilter _quiet;
+
     // ── 1. Load shared library ───────────────────────────────────────────────
     void* dl = dlopen(lib_path, RTLD_NOW | RTLD_LOCAL);
     if (!dl) {
+        _quiet.restore();
         warn_msg("%-18s  dlopen failed: %s", display_name, dlerror());
         return false;
     }
 
     auto getProviders = (QnnGetProvidersFn_t)dlsym(dl, "QnnInterface_getProviders");
     if (!getProviders) {
-        warn_msg("%-18s  QnnInterface_getProviders not found", display_name);
         dlclose(dl);
+        _quiet.restore();
+        warn_msg("%-18s  QnnInterface_getProviders not found", display_name);
         return false;
     }
 
@@ -64,8 +124,9 @@ static bool run_backend(const char*  lib_path,
     const QnnInterface_t** providers = nullptr;
     uint32_t               nProviders = 0;
     if (getProviders(&providers, &nProviders) != QNN_SUCCESS || nProviders == 0) {
-        warn_msg("%-18s  getProviders returned no interface", display_name);
         dlclose(dl);
+        _quiet.restore();
+        warn_msg("%-18s  getProviders returned no interface", display_name);
         return false;
     }
     const QnnInterface_t* iface = providers[0];
@@ -82,8 +143,9 @@ static bool run_backend(const char*  lib_path,
 
     err = QNN_IFACE(iface).backendCreate(log_h, nullptr, &backend);
     if (err != QNN_SUCCESS) {
-        warn_msg("%-18s  backendCreate failed (0x%08x)", display_name, (unsigned)err);
         dlclose(dl);
+        _quiet.restore();
+        warn_msg("%-18s  backendCreate failed (0x%08x)", display_name, (unsigned)err);
         return false;
     }
 
@@ -91,9 +153,10 @@ static bool run_backend(const char*  lib_path,
     Qnn_ContextHandle_t ctx = nullptr;
     err = QNN_IFACE(iface).contextCreate(backend, nullptr, nullptr, &ctx);
     if (err != QNN_SUCCESS) {
-        warn_msg("%-18s  contextCreate failed (0x%08x)", display_name, (unsigned)err);
         QNN_IFACE(iface).backendFree(backend);
         dlclose(dl);
+        _quiet.restore();
+        warn_msg("%-18s  contextCreate failed (0x%08x)", display_name, (unsigned)err);
         return false;
     }
 
@@ -101,6 +164,7 @@ static bool run_backend(const char*  lib_path,
     Qnn_GraphHandle_t graph = nullptr;
     err = QNN_IFACE(iface).graphCreate(ctx, "matmul_test", nullptr, &graph);
     if (err != QNN_SUCCESS) {
+        _quiet.restore();
         warn_msg("%-18s  graphCreate failed (0x%08x)", display_name, (unsigned)err);
         goto free_ctx;
     }
@@ -173,6 +237,7 @@ static bool run_backend(const char*  lib_path,
 
         err = QNN_IFACE(iface).graphAddNode(graph, op);
         if (err != QNN_SUCCESS) {
+            _quiet.restore();
             warn_msg("%-18s  graphAddNode failed (0x%08x)", display_name, (unsigned)err);
             goto free_ctx;
         }
@@ -180,20 +245,22 @@ static bool run_backend(const char*  lib_path,
         // ── 9. Finalize ──────────────────────────────────────────────────────
         err = QNN_IFACE(iface).graphFinalize(graph, nullptr, nullptr);
         if (err != QNN_SUCCESS) {
-            warn_msg("%-18s  graphFinalize failed (0x%08x) — backend may lack HTP firmware",
-                     display_name, (unsigned)err);
+            _quiet.restore();
+            warn_msg("%-18s  graphFinalize failed (0x%08x)", display_name, (unsigned)err);
             goto free_ctx;
         }
 
         // ── 10. Execute (timed) ───────────────────────────────────────────────
         Qnn_Tensor_t exec_in[2]  = { tA, tB };
         Qnn_Tensor_t exec_out[1] = { tC };
-        // Bind actual data pointers at execute time
-        exec_in[0].v1.clientBuf = { const_cast<float*>(h_A), (uint32_t)sz };
-        exec_in[1].v1.clientBuf = { const_cast<float*>(h_B), (uint32_t)sz };
-        exec_out[0].v1.clientBuf= { h_C.data(), (uint32_t)sz };
+        exec_in[0].v1.clientBuf.data      = h_A.data();
+        exec_in[0].v1.clientBuf.dataSize  = (uint32_t)sz;
+        exec_in[1].v1.clientBuf.data      = h_B.data();
+        exec_in[1].v1.clientBuf.dataSize  = (uint32_t)sz;
+        exec_out[0].v1.clientBuf.data     = h_C.data();
+        exec_out[0].v1.clientBuf.dataSize = (uint32_t)sz;
 
-        // Warm-up
+        // Warm-up (stderr silenced — HTP prints DDR bandwidth summary here)
         QNN_IFACE(iface).graphExecute(graph, exec_in, 2, exec_out, 1, nullptr, nullptr);
 
         Timer t;
@@ -201,6 +268,7 @@ static bool run_backend(const char*  lib_path,
         double ms = t.elapsed_ms();
 
         if (err != QNN_SUCCESS) {
+            _quiet.restore();
             warn_msg("%-18s  graphExecute failed (0x%08x)", display_name, (unsigned)err);
             goto free_ctx;
         }
@@ -209,9 +277,18 @@ static bool run_backend(const char*  lib_path,
         float max_err = 0;
         for (int i = 0; i < N*N; i++)
             max_err = std::max(max_err, std::fabs(h_C[i] - h_Cref[i]));
-        bool valid = (max_err < 1e-2f * N);  // tolerance scales with matrix size
+        bool valid = (max_err < 1e-2f * N);
 
         double gflops = 2.0 * N * N * N / 1e9;
+
+        // Teardown while stdout/stderr are still silenced (libraries print on cleanup too)
+        QNN_IFACE(iface).contextFree(ctx, nullptr);
+        QNN_IFACE(iface).backendFree(backend);
+        dlclose(dl);
+
+        // Restore stdout/stderr before printing our own result
+        _quiet.restore();
+
         if (valid) {
             ok_msg("%-18s  %dx%d MatMul: %.2f ms  →  %.1f GFLOP/s  [max_err %.2e] ✓",
                    display_name, N, N, ms, gflops/(ms/1000.0), (double)max_err);
@@ -227,10 +304,6 @@ static bool run_backend(const char*  lib_path,
         res.gops = gflops / (ms / 1000.0);
         res.note = std::string(lib_path) + " — " + (valid?"pass":"mismatch");
         push_result(res);
-
-        QNN_IFACE(iface).contextFree(ctx, nullptr);
-        QNN_IFACE(iface).backendFree(backend);
-        dlclose(dl);
         return valid;
     }
 
@@ -238,31 +311,40 @@ free_ctx:
     QNN_IFACE(iface).contextFree(ctx, nullptr);
     QNN_IFACE(iface).backendFree(backend);
     dlclose(dl);
+    _quiet.restore();
     return false;
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
-void run_qnn_benchmarks(int N)
+void run_qnn_benchmarks()
 {
-    section("QNN Inference  (CPU / NPU-HTP / DSP / GPU)");
+    section("QNN Inference  (CPU / NPU-HTP / GPU)");
 
-    // Build reference inputs and expected output
-    std::vector<float> h_A(N*N), h_B(N*N), h_Cref(N*N, 0.0f);
-    for (int i = 0; i < N*N; i++) {
-        h_A[i] = (float)(i % 13) * 0.1f;
-        h_B[i] = (float)(i % 7)  * 0.1f;
-    }
-    ref_matmul(h_A.data(), h_B.data(), h_Cref.data(), N);
+    // QNN is a unified inference API with multiple hardware backends.
+    // Each backend routes the same model graph to different silicon:
+    //
+    //   QNN-CPU  — executes on the ARM CPU cores (Cortex-A78/A55) in software.
+    //              Good baseline; same correctness path as the reference.
+    //
+    //   QNN-HTP  — Hexagon Tensor Processor.  This IS the NPU / AI Engine
+    //              on the CDSP.  Communicates via FastRPC (libxdsprpc),
+    //              compiles the graph to Hexagon binary on first run.
+    //              Optimised for large models; the fixed FastRPC round-trip
+    //              overhead (~1 ms) dominates tiny inputs.  Use 512×512 to
+    //              amortise that overhead and see real throughput.
+    //
+    //   QNN-GPU  — Adreno 643L GPU via OpenCL compute shaders.
+    //              Faster than CPU for large matrices; lower peak than HTP.
+    //
+    // libQnnDsp.so (legacy ADSP compute DSP) is excluded — not supported on
+    // QCS6490 (AI compute moved to HTP on the CDSP with the Hexagon 690+).
 
-    info_msg("Matrix size: %dx%d float32  (%.1f KB each)", N, N, N*N*4.0/1024.0);
-
-    struct { const char* lib; const char* name; } backends[] = {
-        { "/usr/lib/libQnnCpu.so",  "QNN-CPU" },
-        { "/usr/lib/libQnnHtp.so",  "QNN-HTP (NPU)" },
-        { "/usr/lib/libQnnDsp.so",  "QNN-DSP" },
-        { "/usr/lib/libQnnGpu.so",  "QNN-GPU" },
+    struct { const char* lib; const char* name; int N; } backends[] = {
+        { "/usr/lib/libQnnCpu.so", "QNN-CPU",      64  },
+        { "/usr/lib/libQnnHtp.so", "QNN-HTP (NPU)", 512 },
+        { "/usr/lib/libQnnGpu.so", "QNN-GPU",      128 },
     };
 
     for (auto& b : backends)
-        run_backend(b.lib, b.name, N, h_A.data(), h_B.data(), h_Cref.data());
+        run_backend(b.lib, b.name, b.N);
 }

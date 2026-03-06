@@ -125,7 +125,7 @@ int main(int argc, char** argv)
     run_opencl_benchmarks(nv12.valid() ? nv12.fd() : -1, NV12_W, NV12_H);
 
     // ── QNN inference  (NPU-HTP, DSP, CPU, GPU backends) ─────────────────────
-    run_qnn_benchmarks(64);
+    run_qnn_benchmarks();
 
     // ── VPU encode  (V4L2 M2M, zero-copy from DMA-buf) ───────────────────────
     section("VPU  (V4L2 M2M  msm_vidc  NV12 → H.264)");

@@ -67,42 +67,70 @@ static bool probe_kernel(const char* dev_path, const char* label)
         munmap(cpu_ptr, alloc.size);
     }
 
-    // Map the buffer into DSP virtual address space
-    struct fastrpc_mem_map mmap_req{};
-    mmap_req.version = 0;
-    mmap_req.fd      = alloc.fd;
-    mmap_req.offset  = 0;
-    mmap_req.flags   = FASTRPC_MAP_FD;
-    mmap_req.vaddrin = 0;
-    mmap_req.length  = alloc.size;
-    mmap_req.vaddrout= 0;
-    mmap_req.attrs   = 0;
-
-    if (ioctl(fd, FASTRPC_IOCTL_MEM_MAP, &mmap_req) == 0) {
-        ok_msg("%-12s  MEM_MAP on DSP  →  DSP vaddr=0x%llx  ✓  (zero-copy path)",
-               label, (unsigned long long)mmap_req.vaddrout);
-
-        // Unmap from DSP
-        struct fastrpc_mem_unmap umap{};
-        umap.fd     = alloc.fd;
-        umap.vaddr  = mmap_req.vaddrout;
-        umap.length = alloc.size;
-        ioctl(fd, FASTRPC_IOCTL_MEM_UNMAP, &umap);
-    } else {
-        // MEM_MAP requires a DSP compute process (INIT_CREATE + skel .so).
-        // INIT_ATTACH only attaches to the shell; that's enough for DMA alloc
-        // and the QNN HTP backend handles the full DSP process lifecycle.
-        info_msg("     %s  MEM_MAP: %s  (full map needs DSP compute process via QNN/skel)",
-                 label, strerror(errno));
-    }
-
     // Free the DMA buffer
     uint32_t buf_fd = alloc.fd;
     ioctl(fd, FASTRPC_IOCTL_FREE_DMA_BUFF, &buf_fd);
     close(alloc.fd);
 
+    // Note: FASTRPC_IOCTL_MEM_MAP (DSP-side virtual address mapping) requires
+    // an active DSP compute process (INIT_CREATE + a loaded skel .so).
+    // INIT_ATTACH only attaches to the DSP monitor shell, which is sufficient
+    // for DMA allocation and device probing.  Actual DSP compute and memory
+    // mapping is handled by the QNN HTP backend via libxdsprpc / rpcmem.
+
     close(fd);
     return true;
+}
+
+// ── rpcmem shared-memory test ─────────────────────────────────────────────────
+// rpcmem_alloc is the correct API for allocating CPU↔DSP zero-copy buffers.
+// It creates a DMA-buf backed by the DSP heap and registers it with the FastRPC
+// driver.  The returned fd can be passed directly to QNN (and other DSP callers)
+// for zero-copy data transfer.  This is the real FastRPC memory path — not the
+// raw FASTRPC_IOCTL_MEM_MAP ioctl, which requires a fully loaded DSP skel.
+typedef void* (*rpcmem_alloc_fn)(int heapid, uint32_t flags, int size);
+typedef void  (*rpcmem_free_fn)(void* po);
+typedef int   (*rpcmem_to_fd_fn)(void* po);
+typedef void  (*rpcmem_init_fn)();
+
+static void test_rpcmem(void* dl_cdsp)
+{
+    auto fn_alloc = (rpcmem_alloc_fn) dlsym(dl_cdsp, "rpcmem_alloc");
+    auto fn_free  = (rpcmem_free_fn)  dlsym(dl_cdsp, "rpcmem_free");
+    auto fn_to_fd = (rpcmem_to_fd_fn) dlsym(dl_cdsp, "rpcmem_to_fd");
+    auto fn_init  = (rpcmem_init_fn)  dlsym(dl_cdsp, "rpcmem_init");
+
+    if (!fn_alloc || !fn_free || !fn_to_fd) {
+        warn_msg("%-12s  rpcmem symbols missing from libcdsprpc.so", "rpcmem");
+        return;
+    }
+    if (fn_init) fn_init();
+
+    // RPCMEM_HEAP_ID_SYSTEM = 25 (system heap, accessible from any DSP domain)
+    // RPCMEM_DEFAULT_FLAGS  = 1  (cached, coherent)
+    constexpr int HEAP_SYSTEM   = 25;
+    constexpr int FLAGS_DEFAULT = 1;
+    constexpr int BUF_SIZE      = 64 * 1024;
+
+    void* ptr = fn_alloc(HEAP_SYSTEM, FLAGS_DEFAULT, BUF_SIZE);
+    if (!ptr) {
+        warn_msg("%-12s  rpcmem_alloc(%d KB) failed", "rpcmem", BUF_SIZE / 1024);
+        return;
+    }
+
+    int dma_fd = fn_to_fd(ptr);
+
+    // Write a test pattern and verify CPU read-back
+    auto* p = static_cast<uint32_t*>(ptr);
+    for (int i = 0; i < BUF_SIZE / 4; i++) p[i] = 0xC0DE0000u | (uint32_t)i;
+    bool ok = (p[0] == 0xC0DE0000u &&
+               p[BUF_SIZE/4 - 1] == (0xC0DE0000u | (uint32_t)(BUF_SIZE/4 - 1)));
+
+    ok_msg("%-12s  rpcmem_alloc %d KB  →  CPU ptr=%p  DMA-buf fd=%d  CPU r/w %s",
+           "rpcmem", BUF_SIZE / 1024, ptr, dma_fd, ok ? "✓" : "MISMATCH");
+    info_msg("     DMA-buf fd %d can be zero-copy passed to QNN / any DSP caller", dma_fd);
+
+    fn_free(ptr);
 }
 
 // ── Probe via libcdsprpc userspace library ────────────────────────────────────
@@ -125,8 +153,6 @@ static void probe_userspace_rpc(const char* lib_path, const char* label)
     ok_msg("%-12s  loaded %s", label, lib_path);
 
     // Try to open the builtin DSP shell diagnostics interface.
-    // URI format: "file:///path/to/skel.so:interface_name"
-    // The adsp_default_listener is always present on the ADSP.
     remote_handle h = 0xFFFFFFFF;
     const char* uris[] = {
         "dspqueue_rpc",          // generic DSP queue RPC (often pre-loaded)
@@ -145,6 +171,9 @@ static void probe_userspace_rpc(const char* lib_path, const char* label)
     if (!opened)
         info_msg("     %s  no pre-loaded stub accessible (normal without DSP .so)",
                  label);
+
+    // Test rpcmem — the shared memory allocator used by QNN and all DSP callers
+    test_rpcmem(dl);
 
     dlclose(dl);
 }
