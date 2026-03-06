@@ -269,6 +269,21 @@ kubectl get nodes
 
 ---
 
+## Developer Instructions
+
+For detailed instructions on how to:
+
+- Get an interactive shell inside a pod
+- Run the hardware benchmark (`hw_bench`)
+- Use each SDK (GPU/CPU OpenCL, QNN/NPU, SNPE, VPU, FastRPC/DSP)
+- Understand all available device nodes
+- Build the benchmark from source
+- Why certain symlinks exist and what they do
+
+→ **[INSTRUCTIONS.md](INSTRUCTIONS.md)**
+
+---
+
 ## Repository Structure
 
 ```
@@ -279,6 +294,12 @@ rubik-kubernetes/
 ├── manifests/
 │   ├── qualcomm-device-plugin.yaml   # GPU/NPU/ISP/VPU device plugin DaemonSet
 │   └── session-rbac.yaml             # sessions namespace + RBAC
+├── benchmarks/
+│   ├── src/                          # C++ hardware benchmark source
+│   ├── build.sh                      # Build script
+│   ├── run.sh                        # Run script (host)
+│   └── CMakeLists.txt
+├── INSTRUCTIONS.md                   # SDK usage & pod shell guide
 └── README.md
 ```
 

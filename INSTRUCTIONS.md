@@ -1,0 +1,623 @@
+# Rubik Pi 3 — Hardware Developer Instructions
+
+Practical guide for getting a shell in a Kubernetes pod and using every hardware
+SDK available on the QCS6490 SoC.
+
+---
+
+## Table of Contents
+
+1. [Cluster Access (kubectl)](#1-cluster-access-kubectl)
+2. [Interactive Session Pods](#2-interactive-session-pods)
+3. [Running the Hardware Benchmark](#3-running-the-hardware-benchmark)
+4. [SDK Reference — CPU OpenCL (POCL)](#4-cpu-opencl-pocl)
+5. [SDK Reference — GPU OpenCL (Adreno)](#5-gpu-opencl-adreno-643l)
+6. [SDK Reference — NPU via QNN (Hexagon HTP)](#6-npu-qnn-hexagon-htp)
+7. [SDK Reference — SNPE](#7-snpe-snapdragon-neural-processing-engine)
+8. [SDK Reference — VPU (V4L2 M2M)](#8-vpu-v4l2-m2m-video-codec)
+9. [SDK Reference — DSP / FastRPC](#9-dsp-fastrpc)
+10. [Device Node Map](#10-device-node-map)
+11. [Build the Benchmark from Source](#11-build-the-benchmark-from-source)
+12. [Symlinks and Path Notes](#12-symlinks-and-path-notes)
+
+---
+
+## 1. Cluster Access (kubectl)
+
+`kubectl` is symlinked from the RKE2 bundle during `install.sh`:
+
+```
+/usr/local/bin/kubectl → /var/lib/rancher/rke2/bin/kubectl
+```
+
+The `ubuntu` user gets a kubeconfig at `~/.kube/config` pointing at
+`/etc/rancher/rke2/rke2.yaml`.
+
+```bash
+# Verify cluster is up
+kubectl get nodes
+kubectl get pods -A
+```
+
+To access the cluster from your **laptop**:
+
+```bash
+scp rubik:/etc/rancher/rke2/rke2.yaml ~/.kube/rubikpi.yaml
+# Patch the server address to the Pi's real IP
+sed -i 's/127.0.0.1/<rubikpi-ip>/' ~/.kube/rubikpi.yaml
+export KUBECONFIG=~/.kube/rubikpi.yaml
+kubectl get nodes
+```
+
+---
+
+## 2. Interactive Session Pods
+
+`scripts/session.sh` manages privileged pods in the `sessions` namespace.
+Each pod gets a `bash` shell with the entire `/dev` tree bind-mounted, giving
+direct access to GPU, NPU, VPU, ISP, and DSP.
+
+### Start a session
+
+```bash
+./scripts/session.sh start alice
+```
+
+Pin to a specific node:
+
+```bash
+./scripts/session.sh start alice --node rubikpi-2
+```
+
+Use a custom image (e.g. one that already has your SDKs installed):
+
+```bash
+SESSION_IMAGE=my-registry/rubikpi-dev:latest ./scripts/session.sh start alice
+```
+
+### Connect (interactive shell)
+
+```bash
+./scripts/session.sh connect alice
+```
+
+Drops you into `bash` inside the pod. Type `exit` or Ctrl-D to disconnect
+**without** stopping the session — it keeps running.
+
+### List all sessions
+
+```bash
+./scripts/session.sh list
+```
+
+### Stop a session
+
+```bash
+./scripts/session.sh stop alice
+```
+
+Files written to `/root` inside the session persist at
+`/var/lib/rubikpi-sessions/alice/` on the host node.
+
+### One-liner: start + immediate connect
+
+```bash
+./scripts/session.sh start alice && ./scripts/session.sh connect alice
+```
+
+### Raw kubectl equivalents
+
+If you prefer raw `kubectl` commands:
+
+```bash
+# Open a shell in any running pod
+kubectl exec -it <pod-name> -n sessions -- bash
+
+# Watch pod events
+kubectl describe pod session-alice -n sessions
+
+# Check resource allocation on a node
+kubectl describe node rubikpi | grep -A 10 "Allocated resources"
+```
+
+### Environment variables for session.sh
+
+| Variable | Default | Description |
+|---|---|---|
+| `SESSION_IMAGE` | `ubuntu:22.04` | Container image |
+| `SESSION_CPU_LIM` | `6` | CPU core limit |
+| `SESSION_MEM_LIM` | `8Gi` | Memory limit |
+| `KUBECONFIG` | `/etc/rancher/rke2/rke2.yaml` | kubeconfig path |
+
+---
+
+## 3. Running the Hardware Benchmark
+
+`hw_bench` exercises every hardware subsystem in one run and reports pass/fail
+with timing. It must run directly on the host (or in a privileged pod) because
+it needs `/dev/fastrpc-cdsp`, `/dev/dma_heap`, `/dev/video32`, etc.
+
+### Quick run (on the Pi host directly)
+
+```bash
+cd /home/ubuntu/rubik-kuber/benchmarks
+sudo ./run.sh
+# or equivalently:
+sudo ./build/hw_bench
+```
+
+### Run inside a session pod
+
+Session pods have all device nodes. Copy the binary in and run it:
+
+```bash
+# On the Pi host — start a session, then in another terminal:
+kubectl cp benchmarks/build/hw_bench sessions/session-alice:/root/hw_bench
+./scripts/session.sh connect alice
+# Inside the pod:
+chmod +x /root/hw_bench
+/root/hw_bench
+```
+
+Or mount the benchmark directory at session start (edit `session.sh` to add a
+`hostPath` volume for `/home/ubuntu/rubik-kuber/benchmarks`).
+
+### Expected output
+
+```
+╔══════════════════════════════════════════════════════╗
+║         Rubik Pi 3 — Hardware Benchmark              ║
+╚══════════════════════════════════════════════════════╝
+
+[OpenCL GPU]  platform: QUALCOMM Snapdragon(TM)  device: QUALCOMM Adreno(TM) 643
+  SAXPY  32M floats:  ~2.4 ms  (~53 GFLOPS)
+  MatMul 1024×1024 (tiled, TILE=16):  ~5.2 ms  (~412 GFLOPS)
+
+[OpenCL CPU]  platform: Portable Computing Language  device: cpu-cortex-a78
+  SAXPY  4M floats:   ~1.8 ms
+  MatMul 512×512:     ~290 ms
+
+[QNN CPU]   MatMul 64×64  backend: libQnnCpu.so   OK   ~0.3 ms
+[QNN HTP]   MatMul 64×64  backend: libQnnHtp.so   OK   ~1.1 ms   ← NPU
+[QNN GPU]   MatMul 64×64  backend: libQnnGpu.so   OK   ~2.3 ms
+[VPU H264]  NV12 1920×1080  encode → CAPTURE  OK   ~28 ms
+[FastRPC CDSP]  /dev/fastrpc-cdsp  ioctl probe  OK
+[FastRPC ADSP]  libadsprpc.so  dlopen  OK
+
+══════════════════════════════════════════════════════
+  Result: 8/8 subsystems PASS
+══════════════════════════════════════════════════════
+```
+
+---
+
+## 4. CPU OpenCL (POCL)
+
+**Package:** `pocl-opencl-icd`  
+**ICD file:** `/etc/OpenCL/vendors/pocl.icd`  
+**Library:** `/usr/lib/aarch64-linux-gnu/libpocl.so`
+
+POCL provides a full OpenCL 3.0 implementation targeting the ARM CPU (all 8
+Kryo 670 cores). It is selected automatically when you create an OpenCL context
+with the CPU device type, or by filtering on the `"Portable Computing Language"`
+platform string.
+
+```bash
+# Enumerate platforms and devices
+clinfo
+
+# Check POCL device
+clinfo | grep -A 5 "Portable"
+```
+
+### Compile a minimal OpenCL program against POCL
+
+```bash
+cat > saxpy.cl << 'EOF'
+__kernel void saxpy(__global float* y,
+                    __global const float* x,
+                    float alpha, int n) {
+    int i = get_global_id(0);
+    if (i < n) y[i] = alpha * x[i] + y[i];
+}
+EOF
+
+cat > main.c << 'EOF'
+#define CL_TARGET_OPENCL_VERSION 300
+#include <CL/cl.h>
+#include <stdio.h>
+int main() {
+    cl_platform_id plat; cl_device_id dev;
+    clGetPlatformIDs(1, &plat, NULL);
+    clGetDeviceIDs(plat, CL_DEVICE_TYPE_CPU, 1, &dev, NULL);
+    char name[128]; clGetDeviceName(dev, sizeof(name), name, NULL);
+    printf("CPU device: %s\n", name);
+    return 0;
+}
+EOF
+
+gcc main.c -lOpenCL -o main && ./main
+```
+
+---
+
+## 5. GPU OpenCL (Adreno 643L)
+
+**Package:** `qcom-adreno1`  
+**ICD file:** `/etc/OpenCL/vendors/adreno.icd`  
+**OpenCL loader:** `/usr/lib/aarch64-linux-gnu/libOpenCL.so.1` (provided by `qcom-adreno1`)  
+**Adreno ICD:** `/usr/lib/aarch64-linux-gnu/libOpenCL_adreno.so.1`  
+**Core driver:** `/usr/lib/aarch64-linux-gnu/libCB.so.1` (dynamically loaded by the ICD)  
+**Linker symlink:** `/usr/lib/aarch64-linux-gnu/libOpenCL.so → libOpenCL.so.1`
+
+The linker name `libOpenCL.so` is created by `install.sh` because
+`ocl-icd-opencl-dev` (which normally creates it) conflicts with `qcom-adreno1`.
+See [§12](#12-symlinks-and-path-notes) for details.
+
+```bash
+# Confirm GPU platform is enumerated
+clinfo | grep -A 5 "QUALCOMM"
+
+# Device info
+clinfo | grep -E "Device Name|Max compute units|Global mem"
+```
+
+### Key Adreno OpenCL facts
+
+| Topic | Detail |
+|---|---|
+| Platform string | `QUALCOMM Snapdragon(TM)` |
+| Device string | `QUALCOMM Adreno(TM) 643` |
+| `cl_arm_import_memory` | **Not supported** — importing DMABufs via ARM extension fails |
+| `cl_qcom_dmabuf_host_ptr` | Advertised but not functional for true zero-copy on this driver |
+| DMABuf workaround | `CL_MEM_USE_HOST_PTR` with `mmap`'d DMABuf address, then `clEnqueueMapBuffer(CL_MAP_READ)` to flush GPU→host |
+| Best kernel type for GPU | Tiled MatMul with `__local` memory (`TILE=16`), `reqd_work_group_size(16,16,1)` |
+
+### Compile an OpenCL program against the Adreno ICD
+
+```bash
+# -lOpenCL links against libOpenCL.so (the ICD loader)
+g++ -std=c++17 myprogram.cpp -lOpenCL -o myprogram
+./myprogram
+
+# The ICD loader will enumerate both POCL (CPU) and Adreno (GPU) platforms.
+# Select GPU with:
+#   clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, ...)
+```
+
+### Choose GPU platform explicitly in code
+
+```cpp
+cl_uint num_platforms;
+clGetPlatformIDs(0, nullptr, &num_platforms);
+std::vector<cl_platform_id> platforms(num_platforms);
+clGetPlatformIDs(num_platforms, platforms.data(), nullptr);
+for (auto& p : platforms) {
+    char name[128]; clGetPlatformInfo(p, CL_PLATFORM_NAME, sizeof(name), name, nullptr);
+    if (std::string(name).find("QUALCOMM") != std::string::npos) {
+        // use this platform for GPU
+    }
+}
+```
+
+---
+
+## 6. NPU — QNN (Hexagon HTP)
+
+**Package:** `libqnn1`, `libqnn-dev`, `qnn-tools`  
+**Libraries:** `/usr/lib/libQnn*.so` — one `.so` per backend  
+**Headers:** `/usr/include/QNN/`, `/usr/include/HTP/`, `/usr/include/GPU/`, `/usr/include/CPU/`, `/usr/include/DSP/`  
+**CLI tool:** `/usr/bin/qnn-net-run`  
+**Device node:** `/dev/fastrpc-cdsp` (+ `/dev/fastrpc-cdsp-secure`)  
+**Daemons required:** `cdsprpcd` (must be running — enabled by `install.sh`)
+
+### QNN backends
+
+| Backend library | Hardware | Notes |
+|---|---|---|
+| `libQnnCpu.so` | ARM CPU | Always available, no special device |
+| `libQnnHtp.so` | Hexagon HTP (NPU) | Requires `/dev/fastrpc-cdsp` + `cdsprpcd` |
+| `libQnnGpu.so` | Adreno GPU | Requires Adreno driver |
+| `libQnnDsp.so` | Hexagon ADSP | Requires `/dev/fastrpc-adsp-secure` |
+
+### Platform validator
+
+```bash
+qnn-platform-validator --backend /usr/lib/libQnnHtp.so
+qnn-platform-validator --backend /usr/lib/libQnnCpu.so
+```
+
+### Run a model with qnn-net-run
+
+```bash
+# Build a QNN context binary from a floating-point DLC or ONNX model first:
+qnn-context-binary-generator \
+  --backend /usr/lib/libQnnHtp.so \
+  --model my_model.so \
+  --output_dir context_out
+
+# Then run inference:
+qnn-net-run \
+  --backend /usr/lib/libQnnHtp.so \
+  --retrieve_context context_out/my_model.bin \
+  --input_list input_list.txt
+```
+
+### Using QNN in C++
+
+Link flags:
+
+```cmake
+target_link_libraries(myapp dl)
+# QNN is loaded at runtime via dlopen — no compile-time link needed
+```
+
+Runtime backend load pattern:
+
+```cpp
+#include "QnnInterface.h"
+void* backend_lib = dlopen("/usr/lib/libQnnHtp.so", RTLD_NOW | RTLD_LOCAL);
+QNN_INTERFACE_VER_TYPE qnn_interface;
+Qnn_BackendHandle_t backend;
+// ... call QnnInterface_getProviders, then backendCreate, graphCreate, etc.
+```
+
+---
+
+## 7. SNPE (Snapdragon Neural Processing Engine)
+
+**Package:** `libsnpe1`, `libsnpe-dev`, `snpe-tools`  
+**CLI tools:** `/usr/bin/snpe-net-run`, `/usr/bin/snpe-platform-validator`, `/usr/bin/snpe-throughput-net-run`  
+**Headers:** `/usr/include/SNPE/`
+
+SNPE is the older Qualcomm inference SDK. It supports DLC model format and can
+run on CPU, GPU, and DSP/HTP runtimes.
+
+```bash
+# Validate available runtimes
+snpe-platform-validator
+
+# Run a DLC model
+snpe-net-run \
+  --container my_model.dlc \
+  --input_list input_list.txt \
+  --use_gpu          # or --use_dsp, --use_cpu (default)
+```
+
+SNPE uses a simpler API than QNN and is a good choice when working with existing
+`.dlc` files or GStreamer's `mlsnpe` plugin.
+
+---
+
+## 8. VPU — V4L2 M2M (Video Codec)
+
+**Driver:** `msm_vidc` (in-kernel, no extra packages needed)  
+**Device nodes:** `/dev/video32` (encoder), `/dev/video33` (decoder)  
+**Packages:** `v4l-utils`, `gstreamer1.0-plugins-bad`
+
+The VPU supports H.264, H.265, VP9, AV1 encode/decode via the V4L2
+memory-to-memory API.
+
+### Inspect the codec
+
+```bash
+# List all V4L2 devices
+v4l2-ctl --list-devices
+
+# Check encoder capabilities
+v4l2-ctl -d /dev/video32 --list-formats-out   # OUTPUT (input frames)
+v4l2-ctl -d /dev/video32 --list-formats       # CAPTURE (encoded output)
+
+# Check what controls the encoder supports
+v4l2-ctl -d /dev/video32 --list-ctrls
+```
+
+### GStreamer H.264 encode (host, no pod needed)
+
+```bash
+# Encode a test pattern to H.264
+gst-launch-1.0 \
+  videotestsrc num-buffers=60 ! \
+  video/x-raw,width=1920,height=1080,framerate=30/1 ! \
+  v4l2h264enc device=/dev/video32 ! \
+  h264parse ! \
+  mp4mux ! \
+  filesink location=out.mp4
+```
+
+### GStreamer H.264 decode
+
+```bash
+gst-launch-1.0 \
+  filesrc location=out.mp4 ! \
+  qtdemux ! h264parse ! \
+  v4l2h264dec device=/dev/video33 ! \
+  videoconvert ! \
+  autovideosink
+```
+
+### V4L2 M2M programming notes
+
+The `msm_vidc` firmware uses `V4L2_MEMORY_MMAP` buffers for the OUTPUT queue
+(input frames) — **not** `DMABUF`. The correct sequence is:
+
+1. `VIDIOC_S_FMT` on OUTPUT (NV12) and CAPTURE (H264)
+2. `VIDIOC_REQBUFS` with `V4L2_MEMORY_MMAP` on OUTPUT
+3. `VIDIOC_QUERYBUF` + `mmap()` each OUTPUT buffer
+4. Copy NV12 frame data into the `mmap`'d buffer
+5. `VIDIOC_QBUF` the OUTPUT buffer
+6. `VIDIOC_REQBUFS` + `VIDIOC_QBUF` for CAPTURE buffers
+7. `VIDIOC_STREAMON` for OUTPUT and CAPTURE (do **not** call STREAMON on the
+   META_CAPTURE queue — the driver manages it internally)
+8. `poll()` waiting for CAPTURE readability
+
+See `benchmarks/src/vpu_codec.cpp` for a working C++ implementation.
+
+---
+
+## 9. DSP — FastRPC
+
+**Packages:** `qcom-fastrpc1`, `qcom-fastrpc-dev`  
+**Kernel device:** `/dev/fastrpc-cdsp`, `/dev/fastrpc-cdsp-secure` (CDSP / Hexagon HTP)  
+**Kernel device:** `/dev/fastrpc-adsp-secure` (ADSP / audio DSP)  
+**Userspace libraries:** `/usr/lib/aarch64-linux-gnu/libcdsprpc.so`, `libadsprpc.so`  
+**Daemons:** `cdsprpcd`, `adsprpcd`
+
+FastRPC lets userspace code call functions that run on the Hexagon DSPs
+(CDSP = compute DSP used by the HTP/NPU; ADSP = audio/sensor DSP).
+
+### Check that daemons are running
+
+```bash
+systemctl status cdsprpcd
+systemctl status adsprpcd
+```
+
+If they are not running:
+
+```bash
+sudo systemctl enable --now cdsprpcd
+sudo systemctl enable --now adsprpcd
+```
+
+### Probe CDSP from userspace
+
+```bash
+# Kernel ioctl probe — checks if the device responds
+python3 - << 'EOF'
+import fcntl, struct, os
+fd = os.open("/dev/fastrpc-cdsp", os.O_RDWR)
+print("CDSP device opened OK — fd:", fd)
+os.close(fd)
+EOF
+```
+
+### Using FastRPC from C++
+
+```cpp
+#include <dlfcn.h>
+
+// Load the CDSP RPC library
+void* dl = dlopen("/usr/lib/aarch64-linux-gnu/libcdsprpc.so",
+                  RTLD_NOW | RTLD_LOCAL);
+if (!dl) { fprintf(stderr, "dlopen: %s\n", dlerror()); return -1; }
+
+// remote_handle_open opens a FastRPC session to a DSP module
+typedef int (*remote_handle_open_t)(const char* name, unsigned int* handle);
+auto open_fn = (remote_handle_open_t)dlsym(dl, "remote_handle_open");
+
+unsigned int handle;
+int rc = open_fn("file:///libcdsp_default_listener.so?cdsp_domain", &handle);
+printf("CDSP handle: %d  rc=%d\n", handle, rc);
+```
+
+> **Note on libadsprpc:** `remote_handle_open()` in `libadsprpc.so` can hang
+> indefinitely on this system. Only use `dlopen` to verify the library loads;
+> do not call `remote_handle_open` on the ADSP from a non-privileged context.
+> See `benchmarks/src/fastrpc_probe.cpp` for the safe probe pattern.
+
+---
+
+## 10. Device Node Map
+
+| Device node | Hardware | SDK / API |
+|---|---|---|
+| `/dev/dri/renderD128` | Adreno 643L GPU (render) | OpenCL (`qcom-adreno1`), Vulkan |
+| `/dev/dri/card0` | Adreno 643L GPU (display) | DRM/KMS |
+| `/dev/kgsl-3d0` | Adreno 643L GPU (KGSL) | Direct KGSL ioctl (Qualcomm internal) |
+| `/dev/fastrpc-cdsp` | Hexagon 790 CDSP (HTP/NPU) | QNN HTP backend, libcdsprpc |
+| `/dev/fastrpc-cdsp-secure` | CDSP secure world | QNN HTP (secure models) |
+| `/dev/fastrpc-adsp-secure` | ADSP (audio/sensor DSP) | libadsprpc |
+| `/dev/video32` | msm_vidc encoder | V4L2 M2M, GStreamer v4l2h264enc |
+| `/dev/video33` | msm_vidc decoder | V4L2 M2M, GStreamer v4l2h264dec |
+| `/dev/dma_heap/qcom,system` | Qualcomm system DMA heap | `DMA_HEAP_IOCTL_ALLOC` ioctl |
+| `/dev/dma_heap/system` | Generic system DMA heap | `DMA_HEAP_IOCTL_ALLOC` ioctl |
+| `/sys/class/thermal/thermal_zone*` | Thermal sensors | sysfs read |
+| `/proc/cpuinfo` | CPU topology | sysfs read |
+
+---
+
+## 11. Build the Benchmark from Source
+
+The benchmark source lives in `benchmarks/`. It requires the packages installed
+by `install.sh` (QNN, POCL, Adreno OpenCL, FastRPC headers, libdrm).
+
+```bash
+cd /home/ubuntu/rubik-kuber/benchmarks
+
+# Build
+./build.sh
+# → produces build/hw_bench
+
+# Run
+sudo ./run.sh
+# → equivalent to: sudo ./build/hw_bench
+```
+
+### CMake flags
+
+```bash
+# Manual cmake invocation if you want to customise
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+```
+
+### Build dependencies
+
+| Package | Provides |
+|---|---|
+| `cmake`, `build-essential`, `g++` | C++17 build toolchain |
+| `opencl-headers`, `opencl-clhpp-headers` | `CL/cl.h`, `CL/cl.hpp` |
+| `qcom-adreno1` | `libOpenCL.so.1`, `libOpenCL_adreno.so.1`, `libCB.so.1` |
+| `libqnn-dev` | QNN C headers under `/usr/include/QNN/` etc. |
+| `qcom-fastrpc-dev` | FastRPC C headers |
+| `libdrm-dev` | `libdrm.h` for DRM device queries |
+| `pocl-opencl-icd` | CPU OpenCL runtime (ICD) |
+
+---
+
+## 12. Symlinks and Path Notes
+
+Two symlinks were created during initial setup and are now reproduced by
+`install.sh` on every fresh node:
+
+### `/usr/local/bin/kubectl → /var/lib/rancher/rke2/bin/kubectl`
+
+Created by the `setup_kubectl()` step in `install.sh`.  
+Puts `kubectl` on `$PATH` without needing to export `PATH` manually.
+
+```bash
+# Verify
+ls -la /usr/local/bin/kubectl
+which kubectl
+```
+
+### `/usr/lib/aarch64-linux-gnu/libOpenCL.so → libOpenCL.so.1`
+
+Created by the `install_qcom_hw_stack()` step in `install.sh`.
+
+**Why this is needed:** `qcom-adreno1` ships `libOpenCL.so.1` (the runtime
+shared library) but NOT `libOpenCL.so` (the bare linker name that the compiler
+looks for when you pass `-lOpenCL`).
+
+Normally `ocl-icd-opencl-dev` provides this symlink — but that package
+**conflicts** with `qcom-adreno1`: installing it would replace the Adreno ICD
+with the generic one and remove the GPU OpenCL driver.
+
+The fix in `install.sh`:
+
+```bash
+ln -sf libOpenCL.so.1 /usr/lib/aarch64-linux-gnu/libOpenCL.so
+```
+
+This lets `g++ myprogram.cpp -lOpenCL` link correctly while keeping Adreno GPU
+OpenCL operational.
+
+```bash
+# Verify
+ls -la /usr/lib/aarch64-linux-gnu/libOpenCL.so*
+# Expected:
+#   libOpenCL.so      → libOpenCL.so.1         (linker name, our symlink)
+#   libOpenCL.so.1    → libOpenCL.so.1.0.0     (SONAME, from qcom-adreno1)
+#   libOpenCL.so.1.0.0                          (actual library, from qcom-adreno1)
+```

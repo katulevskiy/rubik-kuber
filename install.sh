@@ -167,6 +167,18 @@ install_qcom_hw_stack() {
     g++ \
     libdrm-dev
 
+  # ── libOpenCL.so linker symlink ─────────────────────────────────────────────
+  # qcom-adreno1 ships libOpenCL.so.1 (the runtime) but NOT the bare linker
+  # name libOpenCL.so that the compiler needs for -lOpenCL.
+  # ocl-icd-opencl-dev would normally create this symlink, but it conflicts
+  # with qcom-adreno1 (it would replace the Adreno ICD with the generic one,
+  # losing GPU OpenCL).  Create the symlink explicitly instead.
+  local ocl_lib="/usr/lib/aarch64-linux-gnu/libOpenCL.so"
+  if [[ ! -e "$ocl_lib" && -e "${ocl_lib}.1" ]]; then
+    ln -sf libOpenCL.so.1 "$ocl_lib"
+    log "Created linker symlink: ${ocl_lib} → libOpenCL.so.1"
+  fi
+
   log "Qualcomm hardware SDK stack installed"
 }
 
