@@ -535,7 +535,7 @@ SNPE uses a simpler API than QNN and is a good choice when working with existing
 ## 9. VPU — V4L2 M2M (Video Codec)
 
 **Driver:** `msm_vidc` (in-kernel, no extra packages needed)  
-**Device nodes:** `/dev/video32` (encoder), `/dev/video33` (decoder)  
+**Device nodes:** `/dev/video33` (encoder), `/dev/video32` (decoder)  
 **Packages:** `v4l-utils`, `gstreamer1.0-plugins-bad`
 
 The VPU supports H.264, H.265, VP9, AV1 encode/decode via the V4L2
@@ -548,11 +548,11 @@ memory-to-memory API.
 v4l2-ctl --list-devices
 
 # Check encoder capabilities
-v4l2-ctl -d /dev/video32 --list-formats-out   # OUTPUT (input frames)
-v4l2-ctl -d /dev/video32 --list-formats       # CAPTURE (encoded output)
+v4l2-ctl -d /dev/video33 --list-formats-out   # OUTPUT (input frames)
+v4l2-ctl -d /dev/video33 --list-formats       # CAPTURE (encoded output)
 
 # Check what controls the encoder supports
-v4l2-ctl -d /dev/video32 --list-ctrls
+v4l2-ctl -d /dev/video33 --list-ctrls
 ```
 
 ### GStreamer H.264 encode (host, no pod needed)
@@ -562,7 +562,7 @@ v4l2-ctl -d /dev/video32 --list-ctrls
 gst-launch-1.0 \
   videotestsrc num-buffers=60 ! \
   video/x-raw,width=1920,height=1080,framerate=30/1 ! \
-  v4l2h264enc device=/dev/video32 ! \
+  v4l2h264enc device=/dev/video33 ! \
   h264parse ! \
   mp4mux ! \
   filesink location=out.mp4
@@ -574,9 +574,35 @@ gst-launch-1.0 \
 gst-launch-1.0 \
   filesrc location=out.mp4 ! \
   qtdemux ! h264parse ! \
-  v4l2h264dec device=/dev/video33 ! \
+  v4l2h264dec device=/dev/video32 ! \
   videoconvert ! \
   autovideosink
+```
+
+### Troubleshooting: VPU open fails with "Cannot allocate memory"
+
+The msm_vidc driver supports a maximum of **16 concurrent sessions** system-wide.
+If you see:
+
+```
+✗  VPU  open /dev/video33 failed: msm_vidc session limit (16) reached
+```
+
+it means leaked sessions from previous benchmark runs have exhausted the pool.
+This most commonly occurs when running the benchmark under `--cpu-type gold-plus`
+or `--cpu-type silver`: with only 1–4 cores available, the VPU firmware's HFI
+STOP acknowledgement interrupt can be delayed long enough that the session gets
+stuck in STREAMING state after the fd is closed.
+
+`session.sh stop` automatically resets the driver after every session, but if
+you killed a session without going through `session.sh`, reset it manually:
+
+```bash
+sudo ./scripts/session.sh reset-vpu
+# or directly:
+echo aa00000.video-codec | sudo tee /sys/bus/platform/drivers/msm_vidc_v4l2/unbind
+sleep 1
+echo aa00000.video-codec | sudo tee /sys/bus/platform/drivers/msm_vidc_v4l2/bind
 ```
 
 ### V4L2 M2M programming notes

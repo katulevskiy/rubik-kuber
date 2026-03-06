@@ -561,10 +561,76 @@ cmd_stop() {
     log "Node '${node}' is available again"
   fi
 
+  # Reset the msm_vidc (VPU) driver to free any leaked sessions.
+  # The msm_vidc firmware communicates via HFI interrupts.  When a pod runs
+  # the VPU benchmark while CPU-constrained (e.g. --cpu-type gold-plus), the
+  # single available core may delay firmware interrupt handling long enough
+  # that the STOP acknowledgement arrives after the fd is closed.  This leaves
+  # the session permanently stuck in STREAMING state.  After 16 such runs the
+  # driver refuses all new open() calls with ENOMEM.
+  # The unbind/rebind cycle resets the firmware + driver state cleanly.
+  reset_msm_vidc
+
   log "Session '${username}' stopped"
   echo
   warn "Note: files saved to /root inside the session persist at:"
   echo  "  /var/lib/rubikpi-sessions/${username}/ on the node"
+}
+
+# ── reset-vpu ──────────────────────────────────────────────────────────────────
+# Reset the msm_vidc VPU driver by unbinding and rebinding the platform device.
+# This frees any sessions that are stuck in STREAMING/CLOSE state because the
+# firmware did not send its HFI STOP acknowledgement before the fd was closed.
+# Called automatically by 'stop'; can also be run manually.
+reset_msm_vidc() {
+  local VIDC_DEV="aa00000.video-codec"
+  local VIDC_DRIVER_PATH="/sys/bus/platform/drivers/msm_vidc_v4l2"
+
+  if [[ ! -d "${VIDC_DRIVER_PATH}" ]]; then
+    # Driver not present / not bound — nothing to do
+    return 0
+  fi
+
+  # Count sessions visible in debugfs (one INSTANCE: line per session)
+  local stuck=0
+  stuck=$(cat /sys/kernel/debug/msm_vidc/*/info 2>/dev/null | grep -c "^INSTANCE:" || true)
+
+  if [[ "${stuck}" -eq 0 ]]; then
+    return 0  # no stuck sessions — skip the reset
+  fi
+
+  info "Resetting msm_vidc VPU driver (${stuck} stuck session(s) found)..."
+  if echo "${VIDC_DEV}" > "${VIDC_DRIVER_PATH}/unbind" 2>/dev/null; then
+    sleep 1
+    if echo "${VIDC_DEV}" > "${VIDC_DRIVER_PATH}/bind" 2>/dev/null; then
+      log "msm_vidc VPU driver reset — sessions cleared"
+    else
+      warn "msm_vidc bind failed — VPU may need a reboot to recover"
+    fi
+  else
+    warn "msm_vidc unbind failed (needs root?) — run: sudo $0 reset-vpu"
+  fi
+}
+
+cmd_reset_vpu() {
+  # Check current state
+  local before=0
+  before=$(cat /sys/kernel/debug/msm_vidc/*/info 2>/dev/null | grep -c "^INSTANCE:" || true)
+
+  if [[ "${before}" -eq 0 ]]; then
+    log "msm_vidc VPU: no stuck sessions — nothing to reset"
+    return 0
+  fi
+
+  reset_msm_vidc
+
+  local after=0
+  after=$(cat /sys/kernel/debug/msm_vidc/*/info 2>/dev/null | grep -c "^INSTANCE:" || true)
+  if [[ "${after}" -eq 0 ]]; then
+    log "msm_vidc VPU reset complete — all sessions cleared (${before} freed)"
+  else
+    warn "msm_vidc VPU still has ${after} session(s) after reset — a reboot may be required"
+  fi
 }
 
 # ── untaint ────────────────────────────────────────────────────────────────────
@@ -631,12 +697,13 @@ usage() {
 ${BOLD}Rubik Pi 3 — Interactive Hardware Session Manager${NC}
 
 USAGE
-  $0 start   <username> [--node <nodename>] [--cpu-type <type>]
-  $0 connect <username>
+  $0 start     <username> [--node <nodename>] [--cpu-type <type>]
+  $0 connect   <username>
   $0 list
-  $0 stop    <username>
-  $0 logs    <username>
-  $0 untaint [--all]
+  $0 stop      <username>
+  $0 logs      <username>
+  $0 untaint   [--all]
+  $0 reset-vpu              Reset msm_vidc VPU driver (clears stuck sessions)
 
 CPU AFFINITY  (--cpu-type)
   Pin the interactive shell (and all programs it spawns) to one cluster:
@@ -722,12 +789,13 @@ main() {
   shift || true
 
   case "$cmd" in
-    start)   cmd_start   "$@" ;;
-    connect) cmd_connect "$@" ;;
-    list)    cmd_list       ;;
-    stop)    cmd_stop    "$@" ;;
-    untaint) cmd_untaint "$@" ;;
-    logs)    cmd_logs    "$@" ;;
+    start)     cmd_start     "$@" ;;
+    connect)   cmd_connect   "$@" ;;
+    list)      cmd_list         ;;
+    stop)      cmd_stop      "$@" ;;
+    untaint)   cmd_untaint   "$@" ;;
+    logs)      cmd_logs      "$@" ;;
+    reset-vpu) cmd_reset_vpu    ;;
     help|--help|-h|"") usage ;;
     *) err "Unknown command: ${cmd}. Run '$0 help' for usage." ;;
   esac

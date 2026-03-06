@@ -20,26 +20,70 @@ static int xioctl(int fd, unsigned long req, void* arg) {
     return r;
 }
 
+// ── Find the msm_vidc H.264 encoder device ────────────────────────────────────
+// msm_vidc exposes two M2M multiplanar devices — one encoder, one decoder.
+// Their minor numbers can differ across kernel versions; scan both and pick
+// the one that reports V4L2_CAP_VIDEO_M2M_MPLANE + H.264 encode support.
+static int open_encoder_dev(char* dev_out, size_t dev_out_len)
+{
+    // Candidates in priority order (typical assignment on QCS6490)
+    const char* candidates[] = { "/dev/video33", "/dev/video32", nullptr };
+    for (int i = 0; candidates[i]; i++) {
+        int fd = open(candidates[i], O_RDWR | O_NONBLOCK);
+        if (fd < 0) {
+            if (errno == ENOMEM) {
+                // Session limit hit — no point trying others
+                snprintf(dev_out, dev_out_len, "%s", candidates[i]);
+                return -ENOMEM;
+            }
+            continue;
+        }
+        struct v4l2_capability cap{};
+        if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0 &&
+            (cap.capabilities & V4L2_CAP_VIDEO_M2M_MPLANE)) {
+            // Check it can encode H.264
+            struct v4l2_fmtdesc f{};
+            f.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+            bool has_h264 = false;
+            while (ioctl(fd, VIDIOC_ENUM_FMT, &f) == 0) {
+                if (f.pixelformat == V4L2_PIX_FMT_H264) { has_h264 = true; break; }
+                f.index++;
+            }
+            if (has_h264) {
+                snprintf(dev_out, dev_out_len, "%s", candidates[i]);
+                return fd;
+            }
+        }
+        close(fd);
+    }
+    return -ENODEV;
+}
+
 // ── Main encoder ──────────────────────────────────────────────────────────────
 bool vpu_encode_h264(int dma_fd, int width, int height)
 {
-    const char* enc_dev = "/dev/video33";
-    int fd = open(enc_dev, O_RDWR | O_NONBLOCK);
+    char enc_dev[32];
+    int fd = open_encoder_dev(enc_dev, sizeof(enc_dev));
+    if (fd == -ENOMEM) {
+        // msm_vidc firmware session table is full (max 16 concurrent sessions).
+        // This happens when previous encoder sessions were not properly released —
+        // typically caused by the VPU firmware failing to acknowledge STOP in time
+        // when only one CPU core is available (e.g. --cpu-type gold-plus).
+        // Fix: run  sudo ./scripts/session.sh reset-vpu
+        //       or  echo aa00000.video-codec | sudo tee /sys/bus/platform/drivers/msm_vidc_v4l2/unbind
+        //           echo aa00000.video-codec | sudo tee /sys/bus/platform/drivers/msm_vidc_v4l2/bind
+        err_msg("VPU  open %s failed: msm_vidc session limit (16) reached\n"
+                "     Previous sessions leaked (firmware STOP timeout on single-core runs)\n"
+                "     Fix: sudo ./scripts/session.sh reset-vpu",
+                enc_dev);
+        return false;
+    }
     if (fd < 0) {
-        err_msg("VPU  open %s failed: %s", enc_dev, strerror(errno));
+        err_msg("VPU  no H.264 M2M encoder found in /dev/video*");
         return false;
     }
 
-    // ── Verify it's a M2M encoder ──────────────────────────────────────────────
-    struct v4l2_capability cap{};
-    if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
-        err_msg("VPU  VIDIOC_QUERYCAP failed");
-        close(fd); return false;
-    }
-    if (!(cap.capabilities & V4L2_CAP_VIDEO_M2M_MPLANE)) {
-        err_msg("VPU  %s is not a M2M_MPLANE device", enc_dev);
-        close(fd); return false;
-    }
+    // Device was validated (M2M_MPLANE + H.264) by open_encoder_dev()
 
     // ── OUTPUT (raw NV12 input) ────────────────────────────────────────────────
     struct v4l2_format fmt{};
