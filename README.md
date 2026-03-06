@@ -174,6 +174,34 @@ disconnect — the session **keeps running** until explicitly stopped.
 ./scripts/session.sh start alice --node rubikpi-2
 ```
 
+### Pin a session to a specific CPU core type
+
+The QCS6490 / Kryo 670 has three CPU clusters. Use `--cpu-type` to restrict the
+interactive shell (and all programs it spawns) to one cluster:
+
+| Flag | Cores | Architecture | Frequency |
+|---|---|---|---|
+| `--cpu-type silver` | 0–3 | Cortex-A55 | 1.96 GHz (efficiency) |
+| `--cpu-type gold` | 4–6 | Cortex-A78 | 2.40 GHz (performance) |
+| `--cpu-type gold-plus` | 7 | Cortex-A78 | 2.71 GHz (prime / boost) |
+| `--cpu-type gold-all` | 4–7 | Cortex-A78 × 4 | all big cores |
+| `--cpu-type all` | 0–7 | — | no affinity (default) |
+
+```bash
+# Benchmark workload on Gold performance cores only
+./scripts/session.sh start alice --cpu-type gold
+
+# Isolate to the single Gold+ prime core for single-thread perf testing
+./scripts/session.sh start alice --cpu-type gold-plus
+
+# Combine with node selection
+./scripts/session.sh start alice --node rubikpi-3 --cpu-type gold
+```
+
+`session.sh connect` applies `taskset(1)` automatically based on the
+`--cpu-type` used at start. See [INSTRUCTIONS.md](INSTRUCTIONS.md#3-cpu-core-affinity)
+for details including `sched_setaffinity` API usage and raw pod YAML patterns.
+
 ### List all sessions
 
 ```bash

@@ -558,6 +558,26 @@ install_device_plugin() {
   fi
 }
 
+label_node_cpu_topology() {
+  # Label this node with its CPU core type assignments so session.sh and other
+  # tools can discover which cpuset corresponds to each Kryo 670 cluster.
+  # The QCS6490 topology is fixed on all Rubik Pi 3 boards — three frequency
+  # domains map directly to the three Kubernetes "cpu-type" values:
+  #
+  #   rubikpi.ai/cpu-silver-cores    = "0-3"   Cortex-A55  1.96 GHz  efficiency
+  #   rubikpi.ai/cpu-gold-cores      = "4-6"   Cortex-A78  2.40 GHz  performance
+  #   rubikpi.ai/cpu-gold-plus-cores = "7"     Cortex-A78  2.71 GHz  prime
+  step "Labelling node with CPU core topology"
+  local node
+  node=$(hostname)
+  "$RKE2_KUBECTL" label node "$node" \
+    rubikpi.ai/cpu-silver-cores="0-3" \
+    rubikpi.ai/cpu-gold-cores="4-6" \
+    rubikpi.ai/cpu-gold-plus-cores="7" \
+    --overwrite
+  log "CPU topology labels applied to node '${node}'"
+}
+
 apply_session_rbac() {
   step "Applying session RBAC"
 
@@ -634,6 +654,7 @@ EOF
   install_rancher "$node_ip"
   install_device_plugin
   apply_session_rbac
+  label_node_cpu_topology
 
   print_init_summary "$node_ip" "$token"
 }
@@ -706,6 +727,9 @@ EOF
     wait_for_node_ready "$node_hostname"
     remove_control_plane_taints
   fi
+
+  # Label CPU topology on every joining node (init node labels itself separately)
+  label_node_cpu_topology
 
   print_join_summary
 }

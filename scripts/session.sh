@@ -37,6 +37,55 @@ SESSION_MEM_LIM="${SESSION_MEM_LIM:-8Gi}"
 KUBECONFIG="${KUBECONFIG:-/etc/rancher/rke2/rke2.yaml}"
 KUBECTL="${KUBECTL:-kubectl}"
 
+# ── CPU core type map (QCS6490 / Kryo 670) ─────────────────────────────────────
+# The QCS6490 has three physical CPU clusters:
+#
+#   silver    Cortex-A55  CPUs 0-3  capacity=382/1024  max=1.96 GHz  efficiency
+#   gold      Cortex-A78  CPUs 4-6  capacity=889/1024  max=2.40 GHz  performance
+#   gold-plus Cortex-A78  CPU  7    capacity=1024/1024  max=2.71 GHz  prime (boost)
+#   gold-all              CPUs 4-7  gold + gold-plus combined
+#   all                   CPUs 0-7  no affinity (default)
+#
+# Used by --cpu-type to set taskset affinity in 'connect'.
+cpu_type_to_cores() {
+  case "${1:-all}" in
+    silver)               echo "0-3" ;;
+    gold)                 echo "4-6" ;;
+    gold-plus|gold+)      echo "7"   ;;
+    gold-all|gold+all)    echo "4-7" ;;
+    all|"")               echo "0-7" ;;
+    *)                    echo ""    ;;
+  esac
+}
+
+# Number of physical cores in each CPU type — used to cap POCL worker threads.
+# POCL enumerates compute units from total system CPUs (sysconf _SC_NPROCESSORS_ONLN),
+# not from the process cpuset.  Without this cap, POCL spawns 8 workers for an
+# 8-core system even when taskset restricts execution to e.g. 4 Silver cores,
+# causing thread over-subscription and a large performance drop on compute-heavy
+# OpenCL kernels.
+cpu_type_to_core_count() {
+  case "${1:-all}" in
+    silver)               echo "4" ;;   # CPUs 0-3
+    gold)                 echo "3" ;;   # CPUs 4-6
+    gold-plus|gold+)      echo "1" ;;   # CPU 7
+    gold-all|gold+all)    echo "4" ;;   # CPUs 4-7
+    all|"")               echo ""  ;;   # no cap — let POCL use all CUs
+    *)                    echo ""  ;;
+  esac
+}
+
+cpu_type_description() {
+  case "${1:-all}" in
+    silver)            echo "Cortex-A55  CPUs 0-3  (efficiency, 1.96 GHz)" ;;
+    gold)              echo "Cortex-A78  CPUs 4-6  (performance, 2.40 GHz)" ;;
+    gold-plus|gold+)   echo "Cortex-A78  CPU  7    (prime, 2.71 GHz)" ;;
+    gold-all|gold+all) echo "Cortex-A78  CPUs 4-7  (performance + prime)" ;;
+    all|"")            echo "all 8 cores (no affinity)" ;;
+    *)                 echo "unknown" ;;
+  esac
+}
+
 # Benchmark directory — used for the read-only /benchmark mount inside the pod
 # so users can run hw_bench directly without copying files first.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -96,16 +145,27 @@ pod_node() {
 cmd_start() {
   local username="${1:-}"
   local target_node=""
+  local cpu_type="all"
 
   shift || true
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --node) target_node="${2:-}"; shift 2 ;;
+      --node)     target_node="${2:-}"; shift 2 ;;
+      --cpu-type) cpu_type="${2:-all}"; shift 2 ;;
       *) warn "Unknown argument: $1"; shift ;;
     esac
   done
 
-  [[ -n "$username" ]] || err "Usage: session.sh start <username> [--node <nodename>]"
+  [[ -n "$username" ]] || err "Usage: session.sh start <username> [--node <nodename>] [--cpu-type <type>]"
+
+  local cpu_cores
+  cpu_cores=$(cpu_type_to_cores "$cpu_type")
+  if [[ -z "$cpu_cores" ]]; then
+    err "Unknown --cpu-type '${cpu_type}'. Valid: silver, gold, gold-plus, gold-all, all"
+  fi
+
+  local pocl_cu_count
+  pocl_cu_count=$(cpu_type_to_core_count "$cpu_type")
 
   local pod
   pod=$(pod_name "$username")
@@ -122,6 +182,7 @@ cmd_start() {
 
   info "Starting session for '${username}'..."
   [[ -n "$target_node" ]] && info "Pinning to node: ${target_node}"
+  [[ "$cpu_type" != "all" ]] && info "CPU affinity: ${cpu_type} ($(cpu_type_description "$cpu_type"))"
 
   # Build nodeName stanza if a specific node was requested
   local node_selector_yaml=""
@@ -177,6 +238,8 @@ metadata:
   annotations:
     rubikpi.ai/started-by: "${USER:-unknown}"
     rubikpi.ai/started-at: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    rubikpi.ai/cpu-type: "${cpu_type}"
+    rubikpi.ai/cpu-cores: "${cpu_cores}"
 spec:
 ${node_selector_yaml}
   restartPolicy: Never
@@ -226,6 +289,13 @@ ${node_selector_yaml}
         # Make linker find Qualcomm libs that live under /usr/lib/<multiarch>/
         - name: LD_LIBRARY_PATH
           value: "/usr/lib/aarch64-linux-gnu:/usr/lib:/lib/aarch64-linux-gnu"
+        # Cap POCL worker threads to match the actual number of available cores.
+        # POCL reads total system CPUs (not the process cpuset), so without this
+        # it spawns 8 threads even when only e.g. 4 Silver cores are accessible
+        # via taskset — causing thread over-subscription and poor OpenCL perf.
+        # Empty string when cpu-type=all (POCL uses all CUs, no cap needed).
+        - name: POCL_CPU_MAX_CU_COUNT
+          value: "${pocl_cu_count}"
 
       resources:
         requests:
@@ -343,7 +413,12 @@ EOF
   echo "    NPU  — /dev/fastrpc-cdsp        (Hexagon HTP, QNN)"
   echo "    VPU  — /dev/video32 /video33    (msm_vidc H.264/H.265)"
   echo "    DSP  — /dev/fastrpc-adsp-secure (ADSP)"
-  echo "    CPU  — $(nproc 2>/dev/null || echo "?") cores (Kryo 670)"
+  if [[ "$cpu_type" == "all" ]]; then
+    echo "    CPU  — all 8 cores (Kryo 670: 4×A55 Silver + 3×A78 Gold + 1×A78 Gold+)"
+  else
+    echo "    CPU  — ${cpu_type} only: $(cpu_type_description "$cpu_type")"
+    echo -e "           ${YELLOW}(taskset -c ${cpu_cores} applied on connect)${NC}"
+  fi
   if [[ -n "$BENCHMARK_DIR" ]]; then
     echo "  Benchmark:  /benchmark/build/hw_bench"
   fi
@@ -369,11 +444,30 @@ cmd_connect() {
     *)        err "Session '${username}' is in phase '${phase}' — cannot connect" ;;
   esac
 
+  # Read the CPU affinity stored at session-start time
+  local cpu_type cpu_cores
+  cpu_type=$("$KUBECTL" get pod "$pod" -n "$NAMESPACE" \
+    -o jsonpath='{.metadata.annotations.rubikpi\.ai/cpu-type}' 2>/dev/null || echo "all")
+  cpu_cores=$("$KUBECTL" get pod "$pod" -n "$NAMESPACE" \
+    -o jsonpath='{.metadata.annotations.rubikpi\.ai/cpu-cores}' 2>/dev/null || echo "0-7")
+  cpu_type="${cpu_type:-all}"
+  cpu_cores="${cpu_cores:-0-7}"
+
   info "Connecting to session '${username}'..."
+  if [[ "$cpu_type" != "all" ]]; then
+    info "CPU affinity: ${cpu_type} — pinning shell to cores ${cpu_cores} via taskset"
+  fi
   echo -e "(Type ${BOLD}exit${NC} or press Ctrl-D to disconnect without stopping the session)"
   echo
 
-  exec "$KUBECTL" exec -it "$pod" -n "$NAMESPACE" -- bash
+  if [[ "$cpu_type" == "all" ]]; then
+    exec "$KUBECTL" exec -it "$pod" -n "$NAMESPACE" -- bash
+  else
+    # taskset -c pins the exec'd bash process and all its children to the
+    # specified CPU set.  The process's affinity mask is inherited by every
+    # subprocess spawned from this shell (compilers, inference runtimes, etc.).
+    exec "$KUBECTL" exec -it "$pod" -n "$NAMESPACE" -- taskset -c "$cpu_cores" bash
+  fi
 }
 
 # ── list ───────────────────────────────────────────────────────────────────────
@@ -537,12 +631,24 @@ usage() {
 ${BOLD}Rubik Pi 3 — Interactive Hardware Session Manager${NC}
 
 USAGE
-  $0 start   <username> [--node <nodename>]  Create a new exclusive session
-  $0 connect <username>                       Attach to a running session
-  $0 list                                     List all sessions
-  $0 stop    <username>                       Delete a session + release node
-  $0 logs    <username>                       Stream session logs
-  $0 untaint [--all]                          Remove orphaned session taints
+  $0 start   <username> [--node <nodename>] [--cpu-type <type>]
+  $0 connect <username>
+  $0 list
+  $0 stop    <username>
+  $0 logs    <username>
+  $0 untaint [--all]
+
+CPU AFFINITY  (--cpu-type)
+  Pin the interactive shell (and all programs it spawns) to one cluster:
+
+    silver    Cortex-A55  CPUs 0-3  efficiency cores  (1.96 GHz)
+    gold      Cortex-A78  CPUs 4-6  performance cores  (2.40 GHz)
+    gold-plus Cortex-A78  CPU  7    prime / boost core  (2.71 GHz)
+    gold-all              CPUs 4-7  gold + gold-plus combined
+    all                   CPUs 0-7  no affinity (default)
+
+  Implemented via taskset(1) applied to the exec'd bash on 'connect'.
+  The affinity is inherited by every subprocess in the shell.
 
 EXCLUSIVE ACCESS
   Each session taints its Pi node with:
@@ -556,7 +662,7 @@ HARDWARE INSIDE SESSIONS
   NPU   /dev/fastrpc-cdsp             Hexagon HTP (QNN HTP backend)
   VPU   /dev/video32, /dev/video33    msm_vidc (H.264/H.265 encode+decode)
   DSP   /dev/fastrpc-adsp-secure      ADSP
-  CPU   8 cores                        Kryo 670 (A78+A55)
+  CPU   8 cores                        Kryo 670 (4×A55 Silver + 3×A78 Gold + 1×A78 Gold+)
 
 SDKS AVAILABLE IN SESSIONS (from host /usr/lib)
   OpenCL  — libOpenCL.so.1, libOpenCL_adreno.so.1 (GPU), POCL (CPU)
@@ -575,13 +681,22 @@ ENVIRONMENT
   KUBECONFIG       Path to kubeconfig (default: /etc/rancher/rke2/rke2.yaml)
 
 EXAMPLES
-  # Start a session (scheduler picks the node)
+  # Start a session (scheduler picks the node, all cores)
   $0 start alice
 
-  # Start a session pinned to a specific Pi
-  $0 start alice --node rubikpi-3
+  # Start a session pinned to Gold performance cores only
+  $0 start alice --cpu-type gold
 
-  # Connect (drops into bash with full hardware + SDK access)
+  # Start a session pinned to the single Gold+ prime core
+  $0 start alice --cpu-type gold-plus
+
+  # Start a session pinned to Silver efficiency cores only
+  $0 start alice --cpu-type silver
+
+  # Pin to specific Pi node + Gold cores
+  $0 start alice --node rubikpi-3 --cpu-type gold
+
+  # Connect (drops into bash; taskset is applied automatically if cpu-type was set)
   $0 connect alice
 
   # Run the hardware benchmark immediately after connecting

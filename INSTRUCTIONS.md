@@ -9,16 +9,17 @@ SDK available on the QCS6490 SoC.
 
 1. [Cluster Access (kubectl)](#1-cluster-access-kubectl)
 2. [Interactive Session Pods](#2-interactive-session-pods)
-3. [Running the Hardware Benchmark](#3-running-the-hardware-benchmark)
-4. [SDK Reference — CPU OpenCL (POCL)](#4-cpu-opencl-pocl)
-5. [SDK Reference — GPU OpenCL (Adreno)](#5-gpu-opencl-adreno-643l)
-6. [SDK Reference — NPU via QNN (Hexagon HTP)](#6-npu-qnn-hexagon-htp)
-7. [SDK Reference — SNPE](#7-snpe-snapdragon-neural-processing-engine)
-8. [SDK Reference — VPU (V4L2 M2M)](#8-vpu-v4l2-m2m-video-codec)
-9. [SDK Reference — DSP / FastRPC](#9-dsp-fastrpc)
-10. [Device Node Map](#10-device-node-map)
-11. [Build the Benchmark from Source](#11-build-the-benchmark-from-source)
-12. [Symlinks and Path Notes](#12-symlinks-and-path-notes)
+3. [CPU Core Affinity](#3-cpu-core-affinity)
+4. [Running the Hardware Benchmark](#4-running-the-hardware-benchmark)
+5. [SDK Reference — CPU OpenCL (POCL)](#5-cpu-opencl-pocl)
+6. [SDK Reference — GPU OpenCL (Adreno)](#6-gpu-opencl-adreno-643l)
+7. [SDK Reference — NPU via QNN (Hexagon HTP)](#7-npu-qnn-hexagon-htp)
+8. [SDK Reference — SNPE](#8-snpe-snapdragon-neural-processing-engine)
+9. [SDK Reference — VPU (V4L2 M2M)](#9-vpu-v4l2-m2m-video-codec)
+10. [SDK Reference — DSP / FastRPC](#10-dsp-fastrpc)
+11. [Device Node Map](#11-device-node-map)
+12. [Build the Benchmark from Source](#12-build-the-benchmark-from-source)
+13. [Symlinks and Path Notes](#13-symlinks-and-path-notes)
 
 ---
 
@@ -150,7 +151,126 @@ kubectl get node rubikpi -o jsonpath='{.spec.taints}'
 
 ---
 
-## 3. Running the Hardware Benchmark
+## 3. CPU Core Affinity
+
+The QCS6490 / Kryo 670 has three physically distinct CPU clusters with
+different micro-architectures, frequencies, and capacities:
+
+| Type | Cores | Arch | Max freq | EAS capacity | Use for |
+|---|---|---|---|---|---|
+| `silver` | CPUs 0–3 | Cortex-A55 | 1.96 GHz | 382 / 1024 | background, low-power |
+| `gold` | CPUs 4–6 | Cortex-A78 | 2.40 GHz | 889 / 1024 | latency-sensitive, throughput |
+| `gold-plus` | CPU 7 | Cortex-A78 | 2.71 GHz | 1024 / 1024 | single-threaded peak |
+| `gold-all` | CPUs 4–7 | A78 × 4 | — | — | all big cores |
+| `all` | CPUs 0–7 | mixed | — | — | no affinity (default) |
+
+### Pinning a session to a core type
+
+Pass `--cpu-type` to `session.sh start`. The affinity is stored as a pod
+annotation and applied automatically via `taskset(1)` every time you run
+`session.sh connect`:
+
+```bash
+# Gold performance cores only (CPUs 4-6, Cortex-A78 @ 2.4 GHz)
+./scripts/session.sh start alice --cpu-type gold
+
+# Single Gold+ prime core (CPU 7, 2.71 GHz) — best single-thread perf
+./scripts/session.sh start alice --cpu-type gold-plus
+
+# Silver efficiency cores only (CPUs 0-3, A55 @ 1.96 GHz)
+./scripts/session.sh start alice --cpu-type silver
+
+# All big cores together (Gold + Gold+, CPUs 4-7)
+./scripts/session.sh start alice --cpu-type gold-all
+
+# Combine with node selection
+./scripts/session.sh start alice --node rubikpi-3 --cpu-type gold
+```
+
+When you connect, the shell and every program it spawns are pinned:
+
+```bash
+./scripts/session.sh connect alice
+# → [→] CPU affinity: gold — pinning shell to cores 4-6 via taskset
+# Inside the pod, check the affinity of any process:
+taskset -p $$          # current shell
+taskset -p $(pgrep -n my_inference_binary)
+```
+
+### How it works
+
+`session.sh` stores `rubikpi.ai/cpu-type` and `rubikpi.ai/cpu-cores` as pod
+annotations. On `connect`, it reads them and launches:
+
+```bash
+kubectl exec -it session-alice -n sessions -- taskset -c 4-6 bash
+```
+
+`taskset` sets the CPU affinity mask of the bash process. All child processes
+— compilers, runtimes, inference engines — inherit this mask via `fork()`.
+The mask can be inspected or overridden at any time with `taskset -p <pid>`.
+
+### Node labels (for scheduling or custom YAML)
+
+`install.sh` labels every Rubik Pi node with its CPU topology:
+
+```bash
+kubectl get node rubikpi -o jsonpath='{.metadata.labels}' | tr ',' '\n' | grep cpu
+# rubikpi.ai/cpu-gold-cores=4-6
+# rubikpi.ai/cpu-gold-plus-cores=7
+# rubikpi.ai/cpu-silver-cores=0-3
+```
+
+You can use these in your own pod YAML with `nodeSelector` or `nodeAffinity`
+to schedule workloads on nodes that have a specific CPU cluster available
+(useful when managing many Pis with heterogeneous hardware):
+
+```yaml
+spec:
+  nodeSelector:
+    rubikpi.ai/cpu-gold-cores: "4-6"   # schedule only on nodes with Gold cores
+```
+
+### Pinning within your own pod YAML (no session.sh)
+
+For non-interactive pods, add an init container that sets the process affinity,
+or simply invoke your binary via `taskset` in the container command:
+
+```yaml
+spec:
+  containers:
+    - name: inference
+      image: my-inference-image
+      command: ["taskset", "-c", "4-7", "/app/run_model"]
+```
+
+Or set affinity programmatically in C/C++ using `sched_setaffinity(2)`:
+
+```c
+#include <sched.h>
+
+cpu_set_t gold_cores;
+CPU_ZERO(&gold_cores);
+CPU_SET(4, &gold_cores);  // Gold CPUs 4-6
+CPU_SET(5, &gold_cores);
+CPU_SET(6, &gold_cores);
+sched_setaffinity(0, sizeof(gold_cores), &gold_cores);
+```
+
+### Verify affinity inside a session
+
+```bash
+# Check which CPUs your shell is allowed to run on
+taskset -p $$
+
+# Run a quick CPU-bound test and watch which cores are active
+taskset -c 4-6 stress-ng --cpu 3 --timeout 5 &
+cat /proc/$(pgrep stress-ng | head -1)/status | grep Cpus_allowed_list
+```
+
+---
+
+## 4. Running the Hardware Benchmark
 
 `hw_bench` exercises every hardware subsystem in one run and reports pass/fail
 with timing. Session pods (created with `session.sh start`) already have the
@@ -214,7 +334,7 @@ sudo ./run.sh
 
 ---
 
-## 4. CPU OpenCL (POCL)
+## 5. CPU OpenCL (POCL)
 
 **Package:** `pocl-opencl-icd`  
 **ICD file:** `/etc/OpenCL/vendors/pocl.icd`  
@@ -264,7 +384,7 @@ gcc main.c -lOpenCL -o main && ./main
 
 ---
 
-## 5. GPU OpenCL (Adreno 643L)
+## 6. GPU OpenCL (Adreno 643L)
 
 **Package:** `qcom-adreno1`  
 **ICD file:** `/etc/OpenCL/vendors/adreno.icd`  
@@ -325,7 +445,7 @@ for (auto& p : platforms) {
 
 ---
 
-## 6. NPU — QNN (Hexagon HTP)
+## 7. NPU — QNN (Hexagon HTP)
 
 **Package:** `libqnn1`, `libqnn-dev`, `qnn-tools`  
 **Libraries:** `/usr/lib/libQnn*.so` — one `.so` per backend  
@@ -387,7 +507,7 @@ Qnn_BackendHandle_t backend;
 
 ---
 
-## 7. SNPE (Snapdragon Neural Processing Engine)
+## 8. SNPE (Snapdragon Neural Processing Engine)
 
 **Package:** `libsnpe1`, `libsnpe-dev`, `snpe-tools`  
 **CLI tools:** `/usr/bin/snpe-net-run`, `/usr/bin/snpe-platform-validator`, `/usr/bin/snpe-throughput-net-run`  
@@ -412,7 +532,7 @@ SNPE uses a simpler API than QNN and is a good choice when working with existing
 
 ---
 
-## 8. VPU — V4L2 M2M (Video Codec)
+## 9. VPU — V4L2 M2M (Video Codec)
 
 **Driver:** `msm_vidc` (in-kernel, no extra packages needed)  
 **Device nodes:** `/dev/video32` (encoder), `/dev/video33` (decoder)  
@@ -478,7 +598,7 @@ See `benchmarks/src/vpu_codec.cpp` for a working C++ implementation.
 
 ---
 
-## 9. DSP — FastRPC
+## 10. DSP — FastRPC
 
 **Packages:** `qcom-fastrpc1`, `qcom-fastrpc-dev`  
 **Kernel device:** `/dev/fastrpc-cdsp`, `/dev/fastrpc-cdsp-secure` (CDSP / Hexagon HTP)  
@@ -541,7 +661,7 @@ printf("CDSP handle: %d  rc=%d\n", handle, rc);
 
 ---
 
-## 10. Device Node Map
+## 11. Device Node Map
 
 | Device node | Hardware | SDK / API |
 |---|---|---|
@@ -560,7 +680,7 @@ printf("CDSP handle: %d  rc=%d\n", handle, rc);
 
 ---
 
-## 11. Build the Benchmark from Source
+## 12. Build the Benchmark from Source
 
 The benchmark source lives in `benchmarks/`. It requires the packages installed
 by `install.sh` (QNN, POCL, Adreno OpenCL, FastRPC headers, libdrm).
@@ -599,7 +719,7 @@ cmake --build build -j$(nproc)
 
 ---
 
-## 12. How Session Pods Access Host Libraries
+## How Session Pods Access Host Libraries
 
 Session pods do not use a custom container image. Instead, they overlay key
 directories from the host into the container so all Qualcomm SDKs are

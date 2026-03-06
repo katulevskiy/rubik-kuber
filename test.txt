@@ -1,0 +1,15 @@
+sudo ./scripts/session.sh start $USER --cpu-type silver
+
+sudo ./scripts/session.sh connect $USER
+
+cat /proc/self/status | grep Cpus_allowed_list
+
+taskset -p $$
+
+clinfo | grep -E "Device Name|Max compute units"
+
+/benchmark/build/hw_bench
+
+exit
+
+sudo ./scripts/session.sh stop $USER
