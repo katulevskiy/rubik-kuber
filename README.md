@@ -125,7 +125,13 @@ sudo CLUSTER_SERVER="..." CLUSTER_TOKEN="..." CLUSTER_ROLE=agent ./install.sh
 ## Interactive Hardware Sessions
 
 Session pods give users an interactive bash shell with **full access to all
-hardware interfaces** on whichever Pi the pod is scheduled on.
+hardware interfaces** on whichever Pi the pod is scheduled on. Each session is
+**exclusive**: the Pi node is tainted when the session starts, blocking any other
+workload from scheduling there until the session is stopped.
+
+All Qualcomm SDKs (QNN, Adreno OpenCL, FastRPC) are available immediately —
+host libraries are overlaid into the pod, so no custom image is needed.
+The `hw_bench` binary is pre-mounted at `/benchmark/build/hw_bench`.
 
 ### Start a session
 
@@ -133,8 +139,9 @@ hardware interfaces** on whichever Pi the pod is scheduled on.
 ./scripts/session.sh start alice
 ```
 
-The scheduler automatically places the pod on a node that has available GPU and NPU
-resources (via the device plugin). Once running:
+The scheduler automatically places the pod on a node that has available GPU, NPU,
+and VPU resources (all three are consumed so no other pod can use the hardware).
+Once running:
 
 ```
 Session 'alice' is ready
@@ -188,17 +195,27 @@ Active sessions:
 ./scripts/session.sh stop alice
 ```
 
-Files saved under `/root` inside the session are **persisted** on the host node at
-`/var/lib/rubikpi-sessions/alice/` and will be available if the session is restarted
-on the same node.
+This deletes the pod **and removes the node taint**, releasing the Pi for
+other workloads. Files saved under `/root` persist on the host node at
+`/var/lib/rubikpi-sessions/alice/`.
+
+### Clean up orphaned taints
+
+If a pod was killed externally (not via `stop`), the exclusive taint stays
+on the node. Remove it with:
+
+```bash
+./scripts/session.sh untaint --all
+```
 
 ### Session environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `SESSION_IMAGE` | `ubuntu:22.04` | Container image to use |
+| `SESSION_IMAGE` | `ubuntu:24.04` | Container image (must match host OS) |
 | `SESSION_CPU_LIM` | `6` | CPU cores limit per session |
 | `SESSION_MEM_LIM` | `8Gi` | Memory limit per session |
+| `BENCHMARK_DIR` | `<repo>/benchmarks` | Path to benchmarks dir for `/benchmark` mount |
 
 ---
 
@@ -222,9 +239,9 @@ resources:
     rubikpi.ai/npu: "1"
 ```
 
-Session pods use `privileged: true` + direct `/dev` mount, so they have access to
-**all** device nodes (including ones not exposed via the device plugin) without
-needing explicit resource requests.
+Session pods request **all three hardware resources** (`rubikpi.ai/gpu`,
+`rubikpi.ai/npu`, `rubikpi.ai/video`) and also taint the node, ensuring
+**exclusive** access to the entire Pi for the duration of the session.
 
 ---
 

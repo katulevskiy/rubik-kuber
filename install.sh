@@ -276,6 +276,7 @@ install_prereqs() {
 setup_kubectl() {
   step "Setting up kubectl"
 
+  # Symlink kubectl from the RKE2 bundle — works on all node types
   if [[ ! -e /usr/local/bin/kubectl ]]; then
     ln -sf "${RKE2_KUBECTL}" /usr/local/bin/kubectl
   fi
@@ -284,21 +285,42 @@ setup_kubectl() {
 
   local home_dir
   home_dir=$(getent passwd ubuntu 2>/dev/null | cut -d: -f6 || echo "/home/ubuntu")
+
   if [[ -d "$home_dir" ]]; then
-    mkdir -p "${home_dir}/.kube"
-    install -m 600 -o ubuntu -g ubuntu "$KUBECONFIG_PATH" "${home_dir}/.kube/config" 2>/dev/null || true
-    local bashrc="${home_dir}/.bashrc"
-    if ! grep -q "KUBECONFIG" "$bashrc" 2>/dev/null; then
-      {
-        echo ""
-        echo "# RKE2 Kubernetes"
-        echo "export PATH=\$PATH:/var/lib/rancher/rke2/bin"
-        echo "export KUBECONFIG=/etc/rancher/rke2/rke2.yaml"
-      } >> "$bashrc"
+    # Agent nodes do not have a local kubeconfig (rke2-agent writes no server
+    # credentials to disk).  Skip the copy but still add PATH for the binary.
+    if [[ -f "$KUBECONFIG_PATH" ]]; then
+      mkdir -p "${home_dir}/.kube"
+      install -m 600 -o ubuntu -g ubuntu "$KUBECONFIG_PATH" "${home_dir}/.kube/config" 2>/dev/null || true
+      local bashrc="${home_dir}/.bashrc"
+      if ! grep -q "KUBECONFIG" "$bashrc" 2>/dev/null; then
+        {
+          echo ""
+          echo "# RKE2 Kubernetes"
+          echo "export PATH=\$PATH:/var/lib/rancher/rke2/bin"
+          echo "export KUBECONFIG=/etc/rancher/rke2/rke2.yaml"
+        } >> "$bashrc"
+      fi
+      log "kubectl configured (KUBECONFIG=${KUBECONFIG_PATH})"
+    else
+      # Agent node: no server kubeconfig is generated locally.
+      # Use kubectl from a server node, or copy its kubeconfig here manually:
+      #   scp <server>:/etc/rancher/rke2/rke2.yaml ~/.kube/config
+      #   sed -i 's/127.0.0.1/<server-ip>/' ~/.kube/config
+      local bashrc="${home_dir}/.bashrc"
+      if ! grep -q "rancher/rke2/bin" "$bashrc" 2>/dev/null; then
+        {
+          echo ""
+          echo "# RKE2 Kubernetes (agent node — kubectl binary only)"
+          echo "export PATH=\$PATH:/var/lib/rancher/rke2/bin"
+        } >> "$bashrc"
+      fi
+      warn "Agent node: kubectl binary linked but no local kubeconfig."
+      warn "Copy kubeconfig from a server node to use kubectl here:"
+      warn "  scp <server>:/etc/rancher/rke2/rke2.yaml ~/.kube/config"
+      warn "  sed -i 's/127.0.0.1/<server-ip>/' ~/.kube/config"
     fi
   fi
-
-  log "kubectl configured (KUBECONFIG=${KUBECONFIG_PATH})"
 }
 
 # ── Wait helpers ───────────────────────────────────────────────────────────────
@@ -673,6 +695,17 @@ EOF
     sleep 5
   done
   echo
+
+  # Server nodes (additional control-plane members) carry the same
+  # node-role.kubernetes.io/control-plane:NoSchedule taint as the init node.
+  # Remove it so that session pods and workloads can schedule here too.
+  # Agent nodes never have this taint — skip the step for them.
+  if [[ "$rke2_type" == "server" ]]; then
+    local node_hostname
+    node_hostname=$(hostname)
+    wait_for_node_ready "$node_hostname"
+    remove_control_plane_taints
+  fi
 
   print_join_summary
 }

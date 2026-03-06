@@ -2,12 +2,18 @@
 # Rubik Pi 3 — Interactive Hardware Session Manager
 #
 # Provisions privileged Kubernetes pods in the "sessions" namespace.
-# Each pod gets full access to all Qualcomm QCS6490 hardware interfaces:
-#   GPU  (Adreno 643L)    — /dev/dri
-#   NPU  (Hexagon CDSP)   — /dev/fastrpc-cdsp
-#   ISP  (Spectra 570L)   — /dev/video* (cameras)
-#   VPU  (Adreno VPU633)  — /dev/video10+ (video codec)
-#   CPU/Memory/Storage     — via privileged access + cgroup resources
+# Each pod gets EXCLUSIVE access to all Qualcomm QCS6490 hardware on the
+# scheduled Pi node:
+#   GPU  (Adreno 643L)    — /dev/dri, OpenCL via libOpenCL_adreno.so
+#   NPU  (Hexagon CDSP)   — /dev/fastrpc-cdsp, QNN HTP backend
+#   VPU  (Adreno VPU633)  — /dev/video32-33, V4L2 M2M codec
+#   DSP  (Hexagon ADSP)   — /dev/fastrpc-adsp-secure
+#   CPU/Memory/Storage     — privileged access + cgroup resources
+#
+# EXCLUSIVE ACCESS: when a session starts, the Pi node is tainted with
+#   rubikpi.ai/exclusive-session=<username>:NoSchedule
+# This blocks all new workloads from landing on that node until the session
+# is stopped (which removes the taint).  Existing DaemonSet pods are unaffected.
 #
 # Usage:
 #   session.sh start   <username> [--node <nodename>]
@@ -15,12 +21,14 @@
 #   session.sh list
 #   session.sh stop    <username>
 #   session.sh logs    <username>
+#   session.sh untaint [--all]   # remove orphaned session taints
 
 set -euo pipefail
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 NAMESPACE="sessions"
-SESSION_IMAGE="${SESSION_IMAGE:-ubuntu:22.04}"
+# ubuntu:24.04 matches the host OS version so host /usr/lib overlay is ABI-safe
+SESSION_IMAGE="${SESSION_IMAGE:-ubuntu:24.04}"
 SESSION_CPU_REQ="${SESSION_CPU_REQ:-1}"
 SESSION_CPU_LIM="${SESSION_CPU_LIM:-6}"
 SESSION_MEM_REQ="${SESSION_MEM_REQ:-512Mi}"
@@ -28,6 +36,15 @@ SESSION_MEM_LIM="${SESSION_MEM_LIM:-8Gi}"
 
 KUBECONFIG="${KUBECONFIG:-/etc/rancher/rke2/rke2.yaml}"
 KUBECTL="${KUBECTL:-kubectl}"
+
+# Benchmark directory — used for the read-only /benchmark mount inside the pod
+# so users can run hw_bench directly without copying files first.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BENCHMARK_DIR="${BENCHMARK_DIR:-${SCRIPT_DIR}/../benchmarks}"
+BENCHMARK_DIR="$(cd "${BENCHMARK_DIR}" 2>/dev/null && pwd || echo "")"
+
+# Taint applied to the Pi node while a session is active
+SESSION_TAINT_KEY="rubikpi.ai/exclusive-session"
 
 # ── Colours ────────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -45,7 +62,6 @@ pod_name() {
 
 check_kubectl() {
   if ! command -v "$KUBECTL" &>/dev/null; then
-    # Try RKE2 bundled kubectl
     if [[ -x /var/lib/rancher/rke2/bin/kubectl ]]; then
       KUBECTL=/var/lib/rancher/rke2/bin/kubectl
     else
@@ -53,6 +69,27 @@ check_kubectl() {
     fi
   fi
   export KUBECONFIG
+}
+
+# Apply or remove the exclusive-session taint on a node.
+# Usage: taint_node <nodename> <username>   — apply
+#        untaint_node <nodename>            — remove
+taint_node() {
+  local node="$1" username="$2"
+  "$KUBECTL" taint node "$node" \
+    "${SESSION_TAINT_KEY}=${username}:NoSchedule" --overwrite 2>/dev/null || true
+}
+
+untaint_node() {
+  local node="$1"
+  "$KUBECTL" taint node "$node" "${SESSION_TAINT_KEY}-" 2>/dev/null || true
+}
+
+# Return the node a pod is running on, or empty string.
+pod_node() {
+  local pod="$1"
+  "$KUBECTL" get pod "$pod" -n "$NAMESPACE" \
+    -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo ""
 }
 
 # ── start ──────────────────────────────────────────────────────────────────────
@@ -86,21 +123,47 @@ cmd_start() {
   info "Starting session for '${username}'..."
   [[ -n "$target_node" ]] && info "Pinning to node: ${target_node}"
 
-  # Build nodeSelector / nodeName stanza
+  # Build nodeName stanza if a specific node was requested
   local node_selector_yaml=""
   if [[ -n "$target_node" ]]; then
     node_selector_yaml="  nodeName: ${target_node}"
   fi
 
-  # Build device plugin resource requests.
-  # These ensure the scheduler places the pod on a node that has the devices.
-  # The privileged securityContext + /dev mount then gives full hardware access.
-  local device_resources
-  device_resources=$(cat <<'EOF'
-          rubikpi.ai/gpu: "1"
-          rubikpi.ai/npu: "1"
-EOF
-)
+  # Build benchmark mount stanza — only if the benchmark directory exists
+  local bench_mount_yaml="" bench_vol_yaml=""
+  if [[ -n "$BENCHMARK_DIR" && -d "$BENCHMARK_DIR" ]]; then
+    bench_mount_yaml='        - name: benchmark
+          mountPath: /benchmark
+          readOnly: true'
+    bench_vol_yaml="    - name: benchmark
+      hostPath:
+        path: ${BENCHMARK_DIR}"
+  fi
+
+  # ── Create the session pod ─────────────────────────────────────────────────
+  # Key design decisions:
+  #
+  # 1. ALL three device resources are requested (gpu + npu + video).
+  #    The device plugin tracks these as finite (capacity=1 each).  Consuming
+  #    all three prevents any other pod that needs hardware from scheduling on
+  #    the same node via the normal resource-request path.
+  #
+  # 2. The pod spec does NOT carry a toleration for SESSION_TAINT_KEY.
+  #    We apply the taint AFTER the pod is already Running.  This means:
+  #      - The pod itself is unaffected (taints only block NEW scheduling).
+  #      - Any subsequent pod that lacks the toleration (i.e. every other pod)
+  #        is blocked from scheduling on this node for the session's lifetime.
+  #
+  # 3. /usr/lib and /lib/aarch64-linux-gnu from the HOST are overlaid into the
+  #    container.  This gives the container access to all Qualcomm SDKs (QNN,
+  #    Adreno OpenCL, FastRPC) without building a custom image.  ubuntu:24.04
+  #    (default) matches the host OS so the glibc ABI is identical.
+  #
+  # 4. /etc/OpenCL from the HOST is overlaid so the OpenCL ICD loader finds
+  #    both the Adreno GPU ICD and the POCL CPU ICD.
+  #
+  # 5. /benchmark is a read-only bind-mount of the hw_bench binary directory,
+  #    so users can run /benchmark/build/hw_bench immediately after connecting.
 
   "$KUBECTL" apply -f - <<EOF
 apiVersion: v1
@@ -118,32 +181,39 @@ spec:
 ${node_selector_yaml}
   restartPolicy: Never
   hostname: rubikpi
-  # Keep the pod alive until explicitly stopped
   terminationGracePeriodSeconds: 10
 
   containers:
     - name: session
       image: ${SESSION_IMAGE}
       imagePullPolicy: IfNotPresent
-      # sleep infinity keeps the pod alive; users exec into it interactively
       command: ["/bin/bash", "-c"]
       args:
         - |
-          # Install a minimal set of tools on first start
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update -qq 2>/dev/null && \
-          apt-get install -y -qq \
-            bash curl wget git vim nano htop procps iproute2 \
-            python3 python3-pip \
-            v4l-utils mesa-utils \
-            2>/dev/null || true
-          echo "Session ready for ${username}. Hardware available: GPU /dev/dri, NPU /dev/fastrpc-cdsp, ISP /dev/video*, VPU /dev/video10+"
+          echo "=== Rubik Pi 3 Hardware Session ==="
+          echo "User: ${username}  Node: \$(hostname)"
+          echo ""
+          echo "Hardware:"
+          echo "  GPU  /dev/dri/renderD128   — Adreno 643L  (OpenCL, Vulkan)"
+          echo "  NPU  /dev/fastrpc-cdsp     — Hexagon HTP  (QNN)"
+          echo "  VPU  /dev/video32          — msm_vidc     (V4L2 M2M H.264)"
+          echo "  DSP  /dev/fastrpc-adsp-secure"
+          echo ""
+          echo "SDKs (from host /usr/lib):"
+          echo "  OpenCL  : /usr/lib/aarch64-linux-gnu/libOpenCL.so.1"
+          echo "  QNN     : /usr/lib/libQnnHtp.so  /usr/lib/libQnnCpu.so"
+          echo "  FastRPC : /usr/lib/aarch64-linux-gnu/libcdsprpc.so"
+          echo ""
+          if [[ -f /benchmark/build/hw_bench ]]; then
+            echo "Benchmark : /benchmark/build/hw_bench  (run as: /benchmark/build/hw_bench)"
+          fi
+          echo ""
           exec sleep infinity
       stdin: true
       tty: true
 
       securityContext:
-        privileged: true           # Full hardware access
+        privileged: true
         allowPrivilegeEscalation: true
 
       env:
@@ -153,25 +223,54 @@ ${node_selector_yaml}
           value: "${username}"
         - name: HOME
           value: /root
+        # Make linker find Qualcomm libs that live under /usr/lib/<multiarch>/
+        - name: LD_LIBRARY_PATH
+          value: "/usr/lib/aarch64-linux-gnu:/usr/lib:/lib/aarch64-linux-gnu"
 
       resources:
         requests:
           cpu: "${SESSION_CPU_REQ}"
           memory: "${SESSION_MEM_REQ}"
+          rubikpi.ai/gpu: "1"
+          rubikpi.ai/npu: "1"
+          rubikpi.ai/video: "1"
         limits:
           cpu: "${SESSION_CPU_LIM}"
           memory: "${SESSION_MEM_LIM}"
+          rubikpi.ai/gpu: "1"
+          rubikpi.ai/npu: "1"
+          rubikpi.ai/video: "1"
 
       volumeMounts:
-        # Full /dev from the host — provides all hardware interfaces
+        # Full /dev and /sys from the host
         - name: dev
           mountPath: /dev
-        # /sys for sysfs hardware introspection
         - name: sys
           mountPath: /sys
-        # Persistent home directory per user (hostPath — data survives pod restarts)
+        # Host userspace libraries and binaries — gives the container all
+        # Qualcomm SDKs (Adreno OpenCL, QNN, FastRPC) and build tools (ld,
+        # gcc, cmake) without building a custom image.
+        # ABI-safe because SESSION_IMAGE defaults to ubuntu:24.04 = host OS.
+        - name: host-usr-bin
+          mountPath: /usr/bin
+        - name: host-usr-lib
+          mountPath: /usr/lib
+        - name: host-lib-multiarch
+          mountPath: /lib/aarch64-linux-gnu
+        # OpenCL ICD configuration — makes clinfo and OpenCL programs find
+        # both the Adreno GPU ICD and the POCL CPU ICD.
+        - name: host-opencl-icd
+          mountPath: /etc/OpenCL
+        # POCL runtime headers — required for POCL to JIT-compile OpenCL kernels.
+        # POCL resolves its include path relative to libpocl.so as
+        # ../../share/pocl/include, which ends up at /usr/share/pocl/include.
+        - name: host-pocl-share
+          mountPath: /usr/share/pocl
+        # Persistent home per user (survives pod restarts on same node)
         - name: home
           mountPath: /root
+        # hw_bench binary — users can run it directly without copying files
+${bench_mount_yaml}
 
   volumes:
     - name: dev
@@ -180,10 +279,26 @@ ${node_selector_yaml}
     - name: sys
       hostPath:
         path: /sys
+    - name: host-usr-bin
+      hostPath:
+        path: /usr/bin
+    - name: host-usr-lib
+      hostPath:
+        path: /usr/lib
+    - name: host-lib-multiarch
+      hostPath:
+        path: /lib/aarch64-linux-gnu
+    - name: host-opencl-icd
+      hostPath:
+        path: /etc/OpenCL
+    - name: host-pocl-share
+      hostPath:
+        path: /usr/share/pocl
     - name: home
       hostPath:
         path: /var/lib/rubikpi-sessions/${username}
         type: DirectoryOrCreate
+${bench_vol_yaml}
 EOF
 
   info "Pod created — waiting for it to start..."
@@ -204,23 +319,34 @@ EOF
   echo
 
   local node
-  node=$("$KUBECTL" get pod "$pod" -n "$NAMESPACE" \
-    -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo "unknown")
+  node=$(pod_node "$pod")
+
+  if [[ -z "$node" ]]; then
+    warn "Could not determine node — exclusive taint not applied"
+  else
+    info "Applying exclusive-session taint to node '${node}'..."
+    taint_node "$node" "$username"
+    log "Node '${node}' tainted — no new workloads will schedule here until session is stopped"
+  fi
 
   echo
   echo -e "${BOLD}${GREEN}Session '${username}' is ready${NC}"
-  echo -e "  Node:  ${node}"
-  echo -e "  Image: ${SESSION_IMAGE}"
+  echo -e "  Node:       ${node}"
+  echo -e "  Image:      ${SESSION_IMAGE}"
+  [[ -n "$node" ]] && echo -e "  Exclusive:  ${YELLOW}node tainted — other workloads blocked${NC}"
   echo
   echo -e "  ${BOLD}Connect:${NC}  $0 connect ${username}"
   echo -e "  ${BOLD}Stop:${NC}     $0 stop ${username}"
   echo
-  echo "  Hardware available inside the session:"
-  echo "    GPU  — /dev/dri/renderD128  (Adreno 643L)"
-  echo "    NPU  — /dev/fastrpc-cdsp   (Hexagon CDSP)"
-  echo "    ISP  — /dev/video0 ...     (Spectra 570L cameras)"
-  echo "    VPU  — /dev/video10 ...    (Adreno VPU633 codec)"
+  echo "  Hardware inside the session:"
+  echo "    GPU  — /dev/dri/renderD128      (Adreno 643L, OpenCL + Vulkan)"
+  echo "    NPU  — /dev/fastrpc-cdsp        (Hexagon HTP, QNN)"
+  echo "    VPU  — /dev/video32 /video33    (msm_vidc H.264/H.265)"
+  echo "    DSP  — /dev/fastrpc-adsp-secure (ADSP)"
   echo "    CPU  — $(nproc 2>/dev/null || echo "?") cores (Kryo 670)"
+  if [[ -n "$BENCHMARK_DIR" ]]; then
+    echo "  Benchmark:  /benchmark/build/hw_bench"
+  fi
   echo
 }
 
@@ -270,13 +396,14 @@ cmd_list() {
   fi
 
   printf "  %-20s %-30s %-10s %-20s %s\n" "USER" "POD" "STATUS" "NODE" "AGE"
-  printf "  %-20s %-30s %-10s %-20s %s\n" "────────────────────" "──────────────────────────────" "──────────" "────────────────────" "───"
+  printf "  %-20s %-30s %-10s %-20s %s\n" \
+    "────────────────────" "──────────────────────────────" \
+    "──────────" "────────────────────" "───"
 
   while IFS= read -r line; do
     local user pod status node ts
     read -r user pod status node ts <<< "$line"
 
-    # Colourize status
     local status_col
     case "$status" in
       Running) status_col="${GREEN}Running${NC}" ;;
@@ -284,24 +411,30 @@ cmd_list() {
       *)       status_col="${RED}${status}${NC}" ;;
     esac
 
-    # Calculate human-readable age
+    # Check if the node has the exclusive taint for this session
+    local taint_info=""
+    if [[ -n "$node" && "$node" != "<none>" ]]; then
+      local taint
+      taint=$("$KUBECTL" get node "$node" \
+        -o jsonpath="{.spec.taints[?(@.key==\"${SESSION_TAINT_KEY}\")].value}" \
+        2>/dev/null || echo "")
+      [[ -n "$taint" ]] && taint_info=" ${YELLOW}[exclusive]${NC}"
+    fi
+
     local age="?"
     if [[ -n "$ts" ]] && command -v date &>/dev/null; then
       local now start elapsed
       now=$(date +%s 2>/dev/null || echo 0)
       start=$(date -d "$ts" +%s 2>/dev/null || echo "$now")
       elapsed=$(( now - start ))
-      if (( elapsed < 3600 )); then
-        age="$((elapsed / 60))m"
-      elif (( elapsed < 86400 )); then
-        age="$((elapsed / 3600))h"
-      else
-        age="$((elapsed / 86400))d"
+      if   (( elapsed < 3600  )); then age="$((elapsed / 60))m"
+      elif (( elapsed < 86400 )); then age="$((elapsed / 3600))h"
+      else age="$((elapsed / 86400))d"
       fi
     fi
 
     printf "  %-20s %-30s " "$user" "$pod"
-    echo -e "${status_col}"
+    echo -e "${status_col}${taint_info}"
     printf "  %-20s %-30s %-10s %-20s %s\n" "" "" "" "$node" "$age"
   done <<< "$sessions"
   echo
@@ -320,13 +453,69 @@ cmd_stop() {
     return 0
   fi
 
+  # Get the node BEFORE deleting the pod so we can untaint it
+  local node
+  node=$(pod_node "$pod")
+
   info "Stopping session '${username}'..."
   "$KUBECTL" delete pod "$pod" -n "$NAMESPACE" --grace-period=5
+
+  # Remove exclusive taint from the node
+  if [[ -n "$node" ]]; then
+    info "Removing exclusive-session taint from node '${node}'..."
+    untaint_node "$node"
+    log "Node '${node}' is available again"
+  fi
 
   log "Session '${username}' stopped"
   echo
   warn "Note: files saved to /root inside the session persist at:"
   echo  "  /var/lib/rubikpi-sessions/${username}/ on the node"
+}
+
+# ── untaint ────────────────────────────────────────────────────────────────────
+# Removes orphaned session taints (e.g. after a pod was killed externally).
+cmd_untaint() {
+  local all=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all) all=true; shift ;;
+      *) warn "Unknown argument: $1"; shift ;;
+    esac
+  done
+
+  # Find all nodes with the session taint
+  local tainted_nodes
+  tainted_nodes=$("$KUBECTL" get nodes \
+    -o jsonpath="{range .items[*]}{.metadata.name}{'\t'}{range .spec.taints[?(@.key==\"${SESSION_TAINT_KEY}\")]}{.value}{end}{'\n'}{end}" \
+    2>/dev/null | grep -v '^$' || true)
+
+  if [[ -z "$tainted_nodes" ]]; then
+    log "No nodes with session taints found."
+    return 0
+  fi
+
+  echo "Nodes with active session taints:"
+  while IFS=$'\t' read -r node taint_val; do
+    echo "  $node  →  session=${taint_val}"
+    # Check if the session pod is still running
+    local pod_exists=false
+    if [[ -n "$taint_val" ]]; then
+      local pod_check
+      pod_check=$(pod_name "$taint_val")
+      "$KUBECTL" get pod "$pod_check" -n "$NAMESPACE" &>/dev/null && pod_exists=true || true
+    fi
+
+    if [[ "$pod_exists" == "true" ]]; then
+      warn "  → Session pod still running — use 'stop ${taint_val}' to clean up properly"
+    elif [[ "$all" == "true" || -z "$taint_val" ]]; then
+      info "  → Removing orphaned taint from ${node}..."
+      untaint_node "$node"
+      log "  → Taint removed from ${node}"
+    else
+      warn "  → Session pod gone but taint remains — run '$0 untaint --all' to clean up"
+    fi
+  done <<< "$tainted_nodes"
 }
 
 # ── logs ───────────────────────────────────────────────────────────────────────
@@ -341,46 +530,71 @@ cmd_logs() {
     "$KUBECTL" logs "$pod" -n "$NAMESPACE"
 }
 
-# ── usage ──────────────────────────────────────────────────────────────────────
+# ── usage ───────────────────────────────────────────────────────────────────────
 usage() {
   cat <<EOF
 
 ${BOLD}Rubik Pi 3 — Interactive Hardware Session Manager${NC}
 
 USAGE
-  $0 start   <username> [--node <nodename>]  Create a new session
+  $0 start   <username> [--node <nodename>]  Create a new exclusive session
   $0 connect <username>                       Attach to a running session
   $0 list                                     List all sessions
-  $0 stop    <username>                       Delete a session
+  $0 stop    <username>                       Delete a session + release node
   $0 logs    <username>                       Stream session logs
+  $0 untaint [--all]                          Remove orphaned session taints
+
+EXCLUSIVE ACCESS
+  Each session taints its Pi node with:
+    ${SESSION_TAINT_KEY}=<username>:NoSchedule
+  This prevents any new workload from scheduling on that node for the
+  session's lifetime.  The taint is removed automatically on 'stop'.
+  Existing DaemonSet pods (device plugin, etc.) are not affected.
+
+HARDWARE INSIDE SESSIONS
+  GPU   /dev/dri/renderD128           Adreno 643L (OpenCL, Vulkan)
+  NPU   /dev/fastrpc-cdsp             Hexagon HTP (QNN HTP backend)
+  VPU   /dev/video32, /dev/video33    msm_vidc (H.264/H.265 encode+decode)
+  DSP   /dev/fastrpc-adsp-secure      ADSP
+  CPU   8 cores                        Kryo 670 (A78+A55)
+
+SDKS AVAILABLE IN SESSIONS (from host /usr/lib)
+  OpenCL  — libOpenCL.so.1, libOpenCL_adreno.so.1 (GPU), POCL (CPU)
+  QNN     — libQnnHtp.so (NPU), libQnnCpu.so, libQnnGpu.so
+  FastRPC — libcdsprpc.so, libadsprpc.so
+  V4L2    — v4l2-ctl, gst-launch-1.0
+
+BENCHMARK
+  Run /benchmark/build/hw_bench inside any session to test all subsystems.
 
 ENVIRONMENT
-  SESSION_IMAGE   Container image (default: ubuntu:22.04)
-  SESSION_CPU_LIM CPU limit per session (default: 6)
-  SESSION_MEM_LIM Memory limit per session (default: 8Gi)
-  KUBECONFIG      Path to kubeconfig (default: /etc/rancher/rke2/rke2.yaml)
-
-HARDWARE AVAILABLE IN SESSIONS
-  GPU   /dev/dri/renderD128      Adreno 643L (Mesa Turnip Vulkan / Freedreno GL)
-  NPU   /dev/fastrpc-cdsp        Hexagon CDSP (Qualcomm AI Engine)
-  ISP   /dev/video0, video1 ...  Spectra 570L ISP / MIPI cameras
-  VPU   /dev/video10, video11 .. Adreno VPU633 (H.265/H.264/VP9/AV1)
+  SESSION_IMAGE    Container image (default: ubuntu:24.04)
+  SESSION_CPU_LIM  CPU cores limit per session (default: 6)
+  SESSION_MEM_LIM  Memory limit per session (default: 8Gi)
+  BENCHMARK_DIR    Path to benchmarks directory (default: repo/benchmarks)
+  KUBECONFIG       Path to kubeconfig (default: /etc/rancher/rke2/rke2.yaml)
 
 EXAMPLES
-  # Start a session for alice, let scheduler pick the node
+  # Start a session (scheduler picks the node)
   $0 start alice
 
   # Start a session pinned to a specific Pi
-  $0 start bob --node rubikpi-3
+  $0 start alice --node rubikpi-3
 
-  # Connect (drops you into a bash shell with full hardware access)
+  # Connect (drops into bash with full hardware + SDK access)
   $0 connect alice
 
-  # List all running sessions
+  # Run the hardware benchmark immediately after connecting
+  #   (inside the pod):  /benchmark/build/hw_bench
+
+  # List all sessions (shows [exclusive] if taint is active)
   $0 list
 
-  # Stop a session (data in /root is kept on the node)
+  # Stop a session and release the node
   $0 stop alice
+
+  # Clean up orphaned taints after external pod deletion
+  $0 untaint --all
 
 EOF
 }
@@ -397,6 +611,7 @@ main() {
     connect) cmd_connect "$@" ;;
     list)    cmd_list       ;;
     stop)    cmd_stop    "$@" ;;
+    untaint) cmd_untaint "$@" ;;
     logs)    cmd_logs    "$@" ;;
     help|--help|-h|"") usage ;;
     *) err "Unknown command: ${cmd}. Run '$0 help' for usage." ;;

@@ -54,8 +54,15 @@ kubectl get nodes
 ## 2. Interactive Session Pods
 
 `scripts/session.sh` manages privileged pods in the `sessions` namespace.
-Each pod gets a `bash` shell with the entire `/dev` tree bind-mounted, giving
-direct access to GPU, NPU, VPU, ISP, and DSP.
+Each pod gets a `bash` shell with:
+- The entire `/dev` tree bind-mounted (GPU, NPU, VPU, DSP, ISP device nodes)
+- Host `/usr/lib`, `/usr/bin`, `/lib/aarch64-linux-gnu` overlaid so all
+  Qualcomm SDKs (QNN, Adreno OpenCL, FastRPC) and build tools work directly
+- The `hw_bench` binary available at `/benchmark/build/hw_bench`
+
+**Exclusive access:** when a session starts, the Pi node is tainted with
+`rubikpi.ai/exclusive-session=<username>:NoSchedule`. No new workloads can
+schedule there until the session is stopped, which removes the taint.
 
 ### Start a session
 
@@ -69,7 +76,8 @@ Pin to a specific node:
 ./scripts/session.sh start alice --node rubikpi-2
 ```
 
-Use a custom image (e.g. one that already has your SDKs installed):
+Use a custom image (must be Ubuntu 24.04 or compatible — the host `/usr/lib`
+overlay is ABI-safe only against Ubuntu 24.04):
 
 ```bash
 SESSION_IMAGE=my-registry/rubikpi-dev:latest ./scripts/session.sh start alice
@@ -90,14 +98,25 @@ Drops you into `bash` inside the pod. Type `exit` or Ctrl-D to disconnect
 ./scripts/session.sh list
 ```
 
+Sessions show `[exclusive]` when their node taint is active.
+
 ### Stop a session
 
 ```bash
 ./scripts/session.sh stop alice
 ```
 
-Files written to `/root` inside the session persist at
+This deletes the pod **and removes the node taint**, releasing the Pi for
+other workloads. Files written to `/root` persist at
 `/var/lib/rubikpi-sessions/alice/` on the host node.
+
+### Clean up orphaned taints
+
+If a session pod is killed externally (not via `stop`), the taint remains:
+
+```bash
+./scripts/session.sh untaint --all
+```
 
 ### One-liner: start + immediate connect
 
@@ -107,26 +126,26 @@ Files written to `/root` inside the session persist at
 
 ### Raw kubectl equivalents
 
-If you prefer raw `kubectl` commands:
-
 ```bash
 # Open a shell in any running pod
-kubectl exec -it <pod-name> -n sessions -- bash
+kubectl exec -it session-alice -n sessions -- bash
 
-# Watch pod events
+# Watch pod events / scheduling failures
 kubectl describe pod session-alice -n sessions
 
-# Check resource allocation on a node
-kubectl describe node rubikpi | grep -A 10 "Allocated resources"
+# Check resource allocation and taints on a node
+kubectl describe node rubikpi | grep -A 10 "Allocated resources:"
+kubectl get node rubikpi -o jsonpath='{.spec.taints}'
 ```
 
 ### Environment variables for session.sh
 
 | Variable | Default | Description |
 |---|---|---|
-| `SESSION_IMAGE` | `ubuntu:22.04` | Container image |
+| `SESSION_IMAGE` | `ubuntu:24.04` | Container image (must match host OS for lib overlay) |
 | `SESSION_CPU_LIM` | `6` | CPU core limit |
 | `SESSION_MEM_LIM` | `8Gi` | Memory limit |
+| `BENCHMARK_DIR` | `<repo>/benchmarks` | Path to benchmark dir for `/benchmark` mount |
 | `KUBECONFIG` | `/etc/rancher/rke2/rke2.yaml` | kubeconfig path |
 
 ---
@@ -134,59 +153,63 @@ kubectl describe node rubikpi | grep -A 10 "Allocated resources"
 ## 3. Running the Hardware Benchmark
 
 `hw_bench` exercises every hardware subsystem in one run and reports pass/fail
-with timing. It must run directly on the host (or in a privileged pod) because
-it needs `/dev/fastrpc-cdsp`, `/dev/dma_heap`, `/dev/video32`, etc.
+with timing. Session pods (created with `session.sh start`) already have the
+binary at `/benchmark/build/hw_bench` and all SDKs available — **no setup
+needed beyond starting a session**.
 
-### Quick run (on the Pi host directly)
-
-```bash
-cd /home/ubuntu/rubik-kuber/benchmarks
-sudo ./run.sh
-# or equivalently:
-sudo ./build/hw_bench
-```
-
-### Run inside a session pod
-
-Session pods have all device nodes. Copy the binary in and run it:
+### Run inside a session pod (recommended)
 
 ```bash
-# On the Pi host — start a session, then in another terminal:
-kubectl cp benchmarks/build/hw_bench sessions/session-alice:/root/hw_bench
+# Terminal 1: start a session
+./scripts/session.sh start alice
+
+# Terminal 2: connect and run
 ./scripts/session.sh connect alice
-# Inside the pod:
-chmod +x /root/hw_bench
-/root/hw_bench
+# Now inside the pod:
+/benchmark/build/hw_bench
 ```
 
-Or mount the benchmark directory at session start (edit `session.sh` to add a
-`hostPath` volume for `/home/ubuntu/rubik-kuber/benchmarks`).
+### Quick run directly on the Pi host (no pod needed)
 
-### Expected output
+```bash
+cd /path/to/rubik-kuber/benchmarks
+sudo ./run.sh
+# equivalent to: sudo ./build/hw_bench
+```
+
+### Expected output (tested, verified from inside a session pod)
 
 ```
-╔══════════════════════════════════════════════════════╗
-║         Rubik Pi 3 — Hardware Benchmark              ║
-╚══════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════╗
+║   Rubik Pi 3  —  SoC Hardware Benchmark          ║
+╚══════════════════════════════════════════════════╝
 
-[OpenCL GPU]  platform: QUALCOMM Snapdragon(TM)  device: QUALCOMM Adreno(TM) 643
-  SAXPY  32M floats:  ~2.4 ms  (~53 GFLOPS)
-  MatMul 1024×1024 (tiled, TILE=16):  ~5.2 ms  (~412 GFLOPS)
+  OpenCL (CPU + GPU)
+    Platform: QUALCOMM Snapdragon(TM)  Device: QUALCOMM Adreno(TM) 643
+    ✓  SAXPY 32M floats:               ~34 ms   →  ~12 GB/s
+    ✓  MatMul 1024×1024 (tiled 16×16): ~499 ms  →  ~4.3 GFLOP/s
+    ✓  GPU filled NV12 DMA-buf → VPU-ready
 
-[OpenCL CPU]  platform: Portable Computing Language  device: cpu-cortex-a78
-  SAXPY  4M floats:   ~1.8 ms
-  MatMul 512×512:     ~290 ms
+    Platform: Portable Computing Language  Device: cpu--cortex-a55
+    ✓  SAXPY 4M floats:                ~4.7 ms  →  ~10 GB/s
+    ✓  MatMul 512×512 (naive):         ~94 ms   →  ~2.8 GFLOP/s
 
-[QNN CPU]   MatMul 64×64  backend: libQnnCpu.so   OK   ~0.3 ms
-[QNN HTP]   MatMul 64×64  backend: libQnnHtp.so   OK   ~1.1 ms   ← NPU
-[QNN GPU]   MatMul 64×64  backend: libQnnGpu.so   OK   ~2.3 ms
-[VPU H264]  NV12 1920×1080  encode → CAPTURE  OK   ~28 ms
-[FastRPC CDSP]  /dev/fastrpc-cdsp  ioctl probe  OK
-[FastRPC ADSP]  libadsprpc.so  dlopen  OK
+  QNN Inference
+    ✓  QNN-CPU    64×64 MatMul  ~0.09 ms
+    ✓  QNN-HTP    64×64 MatMul  ~1.65 ms  ← NPU (Hexagon HTP)
+    ✓  QNN-GPU    64×64 MatMul  ~0.58 ms
 
-══════════════════════════════════════════════════════
-  Result: 8/8 subsystems PASS
-══════════════════════════════════════════════════════
+  VPU  (V4L2 M2M  msm_vidc)
+    ✓  H.264 encode  640×480 NV12  ~4.3 ms  →  1040 B
+
+  FastRPC
+    ✓  CDSP  /dev/fastrpc-cdsp         open + DMA alloc OK
+    ✓  ADSP  /dev/fastrpc-adsp-secure  open + DMA alloc OK
+
+  ══════════════════════════════════════
+    8 passed / 0 failed / 8 total
+    All subsystems operational ✓
+  ══════════════════════════════════════
 ```
 
 ---
@@ -576,7 +599,34 @@ cmake --build build -j$(nproc)
 
 ---
 
-## 12. Symlinks and Path Notes
+## 12. How Session Pods Access Host Libraries
+
+Session pods do not use a custom container image. Instead, they overlay key
+directories from the host into the container so all Qualcomm SDKs are
+immediately available:
+
+| Volume | Host path | Container path | Purpose |
+|---|---|---|---|
+| `host-usr-bin` | `/usr/bin` | `/usr/bin` | Build tools: `ld`, `gcc`, `cmake`, etc. (needed by POCL JIT) |
+| `host-usr-lib` | `/usr/lib` | `/usr/lib` | QNN, Adreno OpenCL, FastRPC, POCL libraries |
+| `host-lib-multiarch` | `/lib/aarch64-linux-gnu` | `/lib/aarch64-linux-gnu` | C runtime (glibc, etc.) |
+| `host-opencl-icd` | `/etc/OpenCL` | `/etc/OpenCL` | ICD config for Adreno GPU + POCL CPU |
+| `host-pocl-share` | `/usr/share/pocl` | `/usr/share/pocl` | POCL runtime headers for kernel JIT |
+| `dev` | `/dev` | `/dev` | All hardware device nodes |
+| `benchmark` | `<repo>/benchmarks` | `/benchmark` | `hw_bench` binary (read-only) |
+
+**Why overlay instead of a custom image?** The host already has all Qualcomm
+packages installed by `install.sh`. An overlay means zero image-build time and
+automatic updates when host packages are upgraded.
+
+**ABI safety:** The default image is `ubuntu:24.04`, matching the host OS.
+The host's glibc (2.39) replaces the container's glibc via the overlay.
+Since the overlay version matches the image version, there are no ABI
+compatibility issues.
+
+---
+
+## 13. Symlinks and Path Notes
 
 Two symlinks were created during initial setup and are now reproduced by
 `install.sh` on every fresh node:
