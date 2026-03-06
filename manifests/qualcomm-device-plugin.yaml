@@ -62,36 +62,22 @@ metadata:
   namespace: kube-system
 data:
   config.yaml: |
-    # Adreno 643L GPU (MSM DRM driver — mainline Linux)
-    # renderD128 is the render node (no display auth required)
+    resources:
     - name: gpu
       groups:
-        - count: 1
-          paths:
-            - path: /dev/dri/renderD128
-            - path: /dev/dri/card0
-
-    # Hexagon CDSP — AI Engine / NPU (fastrpc driver)
+      - paths:
+          - path: /dev/dri/renderD128
+          - path: /dev/dri/card0
+          - path: /dev/kgsl-3d0
     - name: npu
       groups:
-        - count: 1
-          paths:
-            - path: /dev/fastrpc-cdsp
-
-    # Qualcomm CAMSS ISP — first camera capture node (V4L2)
-    # Additional cameras (/dev/video1, /dev/video2 ...) share the same ISP
-    - name: isp
+      - paths:
+          - path: /dev/fastrpc-cdsp
+    - name: video
       groups:
-        - count: 1
-          paths:
-            - path: /dev/video0
-
-    # Adreno VPU633 video codec — H.264/H.265/VP9/AV1 decode+encode (Venus driver)
-    - name: vpu
-      groups:
-        - count: 1
-          paths:
-            - path: /dev/video10
+      - paths:
+          - path: /dev/video32
+          - path: /dev/video33
 
 ---
 apiVersion: apps/v1
@@ -128,8 +114,10 @@ spec:
           imagePullPolicy: Always
           args:
             - --domain=rubikpi.ai
-            - --config=/config/config.yaml
-            - --listen=/var/lib/kubelet/device-plugins/rubikpi.sock
+            - --plugin-directory=/var/lib/kubelet/device-plugins
+            - --device={"name":"gpu","groups":[{"paths":[{"path":"/dev/dri/renderD128"},{"path":"/dev/dri/card0"},{"path":"/dev/kgsl-3d0"}]}]}
+            - --device={"name":"npu","groups":[{"paths":[{"path":"/dev/fastrpc-cdsp"}]}]}
+            - --device={"name":"video","groups":[{"paths":[{"path":"/dev/video32"},{"path":"/dev/video33"}]}]}
           securityContext:
             privileged: true
             readOnlyRootFilesystem: false
@@ -141,26 +129,17 @@ spec:
               cpu: 100m
               memory: 64Mi
           volumeMounts:
-            # Mount RKE2's kubelet device-plugin dir at the plugin's expected path.
-            # RKE2 uses /var/lib/rancher/rke2/agent/kubelet instead of /var/lib/kubelet.
+            # RKE2 uses /var/lib/rancher/rke2/agent/kubelet instead of /var/lib/kubelet
             - name: device-plugin-dir
               mountPath: /var/lib/kubelet/device-plugins
-            # Full /dev access so the plugin can detect and pass devices to containers
             - name: dev
               mountPath: /dev
-            - name: config
-              mountPath: /config
-              readOnly: true
 
       volumes:
         - name: device-plugin-dir
           hostPath:
-            # RKE2-specific kubelet device-plugin socket directory
-            path: /var/lib/rancher/rke2/agent/kubelet/device-plugins
+            path: /var/lib/kubelet/device-plugins
             type: DirectoryOrCreate
         - name: dev
           hostPath:
             path: /dev
-        - name: config
-          configMap:
-            name: qualcomm-device-config
