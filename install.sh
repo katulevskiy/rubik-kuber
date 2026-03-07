@@ -152,41 +152,26 @@ SOURCES
   dpkg --configure -a 2>/dev/null || true
   apt-get -f install -y -qq 2>/dev/null || true
 
-  # The Rubik Pi base image ships linux-firmware-dragonwing which requires a
-  # specific linux-firmware version (e.g. 0ubuntu2.23) that may not yet be
-  # published to the standard ubuntu-ports repo (which only has 0ubuntu2.14).
-  # When ubuntu.sources is present, apt can see the older ubuntu-ports version
-  # and tries to "install" it as part of dependency resolution for other
-  # packages, which immediately conflicts with dragonwing's requirement.
-  #
-  # Solution: pin linux-firmware to never come from ubuntu-ports.  This tells
-  # apt to leave the currently-installed Thundercomm/Tangshan version alone.
-  # Using a preferences pin (not apt-mark hold) avoids the "held packages were
-  # changed" error that -y triggers when a held package is touched.
-  if dpkg -l linux-firmware-dragonwing &>/dev/null; then
-    # Remove any legacy hold that previous script versions may have set
-    apt-mark unhold linux-firmware 2>/dev/null || true
-    cat > /etc/apt/preferences.d/rubikpi-firmware <<'PREF'
-# Prevent apt from installing linux-firmware from ubuntu-ports.
-# The Rubik Pi ships linux-firmware-dragonwing which requires a version of
-# linux-firmware from the Thundercomm/Tangshan repos only.  Pulling the
-# ubuntu-ports version would break the dragonwing dependency.
-Package: linux-firmware
-Pin: origin "ports.ubuntu.com"
-Pin-Priority: -1
-PREF
-    info "linux-firmware pinned away from ubuntu-ports (avoids linux-firmware-dragonwing conflict)"
-  fi
+  # Remove any legacy apt pins or holds from previous installer versions that
+  # may have been written to prevent linux-firmware from upgrading.  The correct
+  # approach is the opposite: we NEED linux-firmware to upgrade so that
+  # linux-firmware-dragonwing's "Depends: linux-firmware >= 0ubuntu2.23"
+  # is satisfied — otherwise any package that touches this dependency chain
+  # (libqnn1, libsnpe1, etc.) will fail to install.
+  rm -f /etc/apt/preferences.d/rubikpi-firmware
+  apt-mark unhold linux-firmware 2>/dev/null || true
 
   apt-get update -qq
 
   # ── Linux firmware ─────────────────────────────────────────────────────────
-  # Firmware blobs (Adreno, Hexagon HTP, msm_vidc) are already present via
-  # linux-firmware-dragonwing.  Only install linux-firmware explicitly on
-  # boards that don't have the dragonwing package.
-  if ! dpkg -l linux-firmware-dragonwing &>/dev/null; then
-    apt-get install -y -qq linux-firmware || true
-  fi
+  # linux-firmware-dragonwing (pre-installed on Rubik Pi) declares:
+  #   Depends: linux-firmware (>= 0ubuntu2.23)
+  # Fresh board images often have linux-firmware at an older version
+  # (0ubuntu2.14) that doesn't satisfy this.  Upgrade it explicitly so the
+  # dragonwing dependency is satisfied before we try to install any Qualcomm
+  # SDK packages that transitively depend on this being resolved.
+  apt-get install -y -qq linux-firmware || \
+    warn "linux-firmware upgrade failed — QNN/SNPE packages may not install"
 
   # ── Qualcomm AI inference SDKs ─────────────────────────────────────────────
   # QNN and SNPE packages are installed one-by-one so that a single broken
@@ -659,12 +644,25 @@ label_node_cpu_topology() {
   step "Labelling node with CPU core topology"
   local node
   node=$(hostname)
-  "$RKE2_KUBECTL" label node "$node" \
-    rubikpi.ai/cpu-silver-cores="0-3" \
-    rubikpi.ai/cpu-gold-cores="4-6" \
-    rubikpi.ai/cpu-gold-plus-cores="7" \
-    --overwrite
-  log "CPU topology labels applied to node '${node}'"
+
+  # Agent nodes have no local kubeconfig — the RKE2 kubectl binary exists but
+  # KUBECONFIG isn't set, so the label must be applied from the control plane.
+  # We try with whatever KUBECONFIG is available; if it fails we print the
+  # command to run from the init node instead of aborting.
+  if "$RKE2_KUBECTL" label node "$node" \
+      rubikpi.ai/cpu-silver-cores="0-3" \
+      rubikpi.ai/cpu-gold-cores="4-6" \
+      rubikpi.ai/cpu-gold-plus-cores="7" \
+      --overwrite 2>/dev/null; then
+    log "CPU topology labels applied to node '${node}'"
+  else
+    warn "Could not label node locally (agent node has no kubeconfig)."
+    warn "Run this from the control-plane node (rubikpi):"
+    warn "  kubectl label node ${node} \\"
+    warn "    rubikpi.ai/cpu-silver-cores=0-3 \\"
+    warn "    rubikpi.ai/cpu-gold-cores=4-6 \\"
+    warn "    rubikpi.ai/cpu-gold-plus-cores=7 --overwrite"
+  fi
 }
 
 apply_session_rbac() {

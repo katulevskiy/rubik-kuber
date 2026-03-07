@@ -271,6 +271,100 @@ refresh_kubeconfig() {
   fi
 }
 
+# ── Detect node role (server = control-plane, agent = worker) ────────────────
+detect_role() {
+  if systemctl cat rke2-server.service &>/dev/null && \
+     [[ -f "${RKE2_CONFIG_DIR}/config.yaml" ]] && \
+     ! grep -q "^server:" "${RKE2_CONFIG_DIR}/config.yaml" 2>/dev/null; then
+    echo "server"
+  else
+    echo "agent"
+  fi
+}
+
+# ── Agent reconciliation (no etcd, no kubectl, just restart rke2-agent) ──────
+main_agent() {
+  local current_ip="$1"
+  local prev_ip="$2"
+
+  # Agent nodes connect outward to the control-plane — their own IP only
+  # matters for kubelet registration.  RKE2 agent re-registers automatically
+  # on restart, so the only action needed when the IP changes is a service
+  # restart so kubelet picks up the new node IP.
+  if [[ "$current_ip" != "$prev_ip" ]]; then
+    info "Agent IP changed (${prev_ip:-first run} → ${current_ip}) — restarting rke2-agent"
+    systemctl restart rke2-agent 2>/dev/null || true
+  elif ! systemctl is-active --quiet rke2-agent; then
+    info "rke2-agent not running — starting"
+    systemctl start rke2-agent 2>/dev/null || true
+  else
+    info "Agent healthy, no action needed"
+  fi
+
+  echo "$current_ip" > "$STATE_FILE"
+  info "Agent reconciliation complete. Node IP: ${current_ip}"
+}
+
+# ── Server reconciliation (full: etcd reset, MetalLB, Traefik, Rancher) ──────
+main_server() {
+  local current_ip="$1"
+  local prev_ip="$2"
+
+  local stored_etcd_ip
+  stored_etcd_ip=$(etcd_peer_ip)
+
+  info "etcd peer IP    : ${stored_etcd_ip:-<unknown>}"
+
+  local need_rke2_restart=false
+  local need_cluster_reset=false
+
+  if [[ "$current_ip" != "$prev_ip" ]]; then
+    info "Node IP has changed (${prev_ip:-first run} → ${current_ip}) — reconciling"
+    need_rke2_restart=true
+    if [[ -n "$stored_etcd_ip" && "$stored_etcd_ip" != "$current_ip" ]]; then
+      need_cluster_reset=true
+    fi
+  else
+    info "Node IP unchanged (${current_ip}) — checking service health"
+  fi
+
+  update_rke2_config "$current_ip"
+
+  if [[ "$need_cluster_reset" == true ]]; then
+    systemctl stop rke2-server 2>/dev/null || true
+    sleep 2
+    run_cluster_reset
+  fi
+
+  if [[ "$need_rke2_restart" == true ]] || ! systemctl is-active --quiet rke2-server; then
+    info "Starting rke2-server..."
+    systemctl restart rke2-server
+    sleep 10
+  fi
+
+  wait_for_api 72
+  refresh_kubeconfig
+
+  if [[ "$current_ip" != "$prev_ip" ]]; then
+    update_metallb "$current_ip"
+    update_traefik_external_ip "$current_ip"
+    update_rancher "$current_ip" || true
+  else
+    update_traefik_external_ip "$current_ip"
+    patch_rancher_server_url "https://rancher.${current_ip}.nip.io"
+  fi
+
+  echo "$current_ip" > "$STATE_FILE"
+  info "Server reconciliation complete. Node IP: ${current_ip}"
+
+  if [[ "$current_ip" != "$prev_ip" && -f "$HOSTNAME_FILE" ]]; then
+    echo
+    echo "  Rancher UI: https://$(cat "$HOSTNAME_FILE")"
+    echo "  Password:   rubikpi-admin"
+    echo
+  fi
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
   [[ $EUID -eq 0 ]] || err "Run as root: sudo $0"
@@ -281,82 +375,17 @@ main() {
   local prev_ip
   prev_ip=$(last_node_ip)
 
-  local stored_etcd_ip
-  stored_etcd_ip=$(etcd_peer_ip)
+  local role
+  role=$(detect_role)
 
+  info "Node role       : ${role}"
   info "Current node IP : ${current_ip}"
   info "Last seen IP    : ${prev_ip:-<none>}"
-  info "etcd peer IP    : ${stored_etcd_ip:-<unknown>}"
 
-  local need_rke2_restart=false
-  local need_cluster_reset=false
-
-  # ── Detect what changed ────────────────────────────────────────────────────
-  if [[ "$current_ip" != "$prev_ip" ]]; then
-    info "Node IP has changed (${prev_ip:-first run} → ${current_ip}) — reconciling"
-    need_rke2_restart=true
-
-    # Only reset etcd if the peer URL is stale
-    if [[ -n "$stored_etcd_ip" && "$stored_etcd_ip" != "$current_ip" ]]; then
-      need_cluster_reset=true
-    fi
+  if [[ "$role" == "agent" ]]; then
+    main_agent "$current_ip" "$prev_ip"
   else
-    info "Node IP unchanged (${current_ip}) — checking service health"
-  fi
-
-  # ── Always make sure the config reflects the current IP ───────────────────
-  update_rke2_config "$current_ip"
-
-  # ── Cluster reset if etcd peer URL is stale ───────────────────────────────
-  if [[ "$need_cluster_reset" == true ]]; then
-    systemctl stop rke2-server 2>/dev/null || true
-    sleep 2
-    run_cluster_reset
-  fi
-
-  # ── Start / restart rke2-server if IP changed or it is not running ────────
-  if [[ "$need_rke2_restart" == true ]] || ! systemctl is-active --quiet rke2-server; then
-    info "Starting rke2-server..."
-    systemctl restart rke2-server
-    sleep 10
-  fi
-
-  # ── Wait for the API server ───────────────────────────────────────────────
-  wait_for_api 72  # up to 6 minutes
-
-  # ── Refresh kubeconfig now that the API is up ─────────────────────────────
-  refresh_kubeconfig
-
-  # ── Update network-layer resources when IP changed ───────────────────────
-  if [[ "$current_ip" != "$prev_ip" ]]; then
-    # Keep MetalLB pool in the right subnet (for wired setups).
-    update_metallb "$current_ip"
-
-    # Always patch Traefik's externalIPs to the node's own IP so it's
-    # reachable from the LAN regardless of whether MetalLB ARP is working.
-    # On WiFi, ARP-based VIPs are unreliable; externalIPs on the real node
-    # IP always works because the node already owns that IP on the network.
-    update_traefik_external_ip "$current_ip"
-
-    # Use the node IP directly for the Rancher hostname (not the MetalLB VIP).
-    update_rancher "$current_ip" || true
-  else
-    # IP unchanged — still ensure externalIPs is set (survives pod restarts)
-    update_traefik_external_ip "$current_ip"
-    # Ensure server-url is correct even if unchanged
-    patch_rancher_server_url "https://rancher.${current_ip}.nip.io"
-  fi
-
-  # ── Save current IP as the new baseline ──────────────────────────────────
-  echo "$current_ip" > "$STATE_FILE"
-  info "Reconciliation complete. Node IP: ${current_ip}"
-
-  # ── Print summary ─────────────────────────────────────────────────────────
-  if [[ "$current_ip" != "$prev_ip" && -f "$HOSTNAME_FILE" ]]; then
-    echo
-    echo "  Rancher UI: https://$(cat "$HOSTNAME_FILE")"
-    echo "  Password:   rubikpi-admin"
-    echo
+    main_server "$current_ip" "$prev_ip"
   fi
 }
 
