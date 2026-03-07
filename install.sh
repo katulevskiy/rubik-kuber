@@ -121,21 +121,69 @@ install_qcom_hw_stack() {
   step "Installing Qualcomm hardware SDK stack"
 
   export DEBIAN_FRONTEND=noninteractive
+
+  # ── Ensure the standard Ubuntu ARM64 repos are present ───────────────────────
+  # Some Rubik Pi board images ship without the standard Ubuntu sources
+  # (ports.ubuntu.com), leaving only the Thundercomm / Canonical Qualcomm repos.
+  # Without ubuntu-ports, fundamental packages like libatomic1, libgcc-s1, etc.
+  # are missing and most subsequent apt-get calls fail.
+  local ubuntu_sources="/etc/apt/sources.list.d/ubuntu.sources"
+  if ! grep -q "ports.ubuntu.com" "$ubuntu_sources" 2>/dev/null && \
+     ! grep -r "ports.ubuntu.com" /etc/apt/sources.list /etc/apt/sources.list.d/ &>/dev/null; then
+    info "Standard Ubuntu ARM64 repos missing — adding ubuntu.sources"
+    cat > "$ubuntu_sources" <<'SOURCES'
+Types: deb
+URIs: http://ports.ubuntu.com/ubuntu-ports
+Suites: noble noble-updates noble-backports
+Components: main universe restricted multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://ports.ubuntu.com/ubuntu-ports
+Suites: noble-security
+Components: main universe restricted multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+SOURCES
+    log "ubuntu.sources written — standard Ubuntu packages now available"
+  fi
+
+  # ── Repair any interrupted installs or held broken packages ───────────────
+  # This is common on a fresh Rubik Pi image that had a partial update.
+  dpkg --configure -a 2>/dev/null || true
+  apt-get -f install -y -qq 2>/dev/null || true
+
+  # The Rubik Pi base image ships linux-firmware-dragonwing which pegs itself
+  # to a specific linux-firmware version that may not yet be available in the
+  # Ubuntu repos.  Attempting to install or upgrade linux-firmware triggers an
+  # "unmet dependencies / held broken packages" failure that blocks ALL further
+  # apt operations on the node.  We hold linux-firmware at its current version
+  # so apt does not try to resolve that conflict during our install.
+  if dpkg -l linux-firmware-dragonwing &>/dev/null; then
+    apt-mark hold linux-firmware 2>/dev/null || true
+    info "linux-firmware held at current version (avoids linux-firmware-dragonwing conflict)"
+  fi
+
   apt-get update -qq
 
   # ── Linux firmware ─────────────────────────────────────────────────────────
-  # Required for GPU (Adreno), NPU (Hexagon HTP), and VPU (msm_vidc) firmware
-  # blobs to be loaded by the kernel at device initialisation time.
-  apt-get install -y -qq linux-firmware || true
+  # The firmware blobs (Adreno, Hexagon HTP, msm_vidc) are already present in
+  # the Rubik Pi base image via linux-firmware-dragonwing.  We skip an explicit
+  # linux-firmware upgrade here to avoid the version-conflict described above.
+  # On boards that do NOT have linux-firmware-dragonwing, install it normally.
+  if ! dpkg -l linux-firmware-dragonwing &>/dev/null; then
+    apt-get install -y -qq linux-firmware || true
+  fi
 
   # ── Qualcomm AI inference SDKs ─────────────────────────────────────────────
-  # QNN (Qualcomm Neural Network) — provides backends for HTP (NPU Hexagon),
-  # GPU, DSP, and CPU inference.  Required by any workload using the NPU.
-  # SNPE (Snapdragon Neural Processing Engine) — older SDK, still used by many
-  # existing models and by GStreamer's mlsnpe plugin.
-  apt-get install -y -qq \
-    libqnn1 libqnn-dev qnn-tools \
-    libsnpe1 libsnpe-dev snpe-tools
+  # QNN and SNPE packages are installed one-by-one so that a single broken
+  # or unavailable package doesn't block the rest of the stack.
+  # QNN (Qualcomm Neural Network) — HTP/GPU/DSP/CPU inference backends.
+  # SNPE (Snapdragon Neural Processing Engine) — legacy SDK, still widely used.
+  local qnn_pkgs=(libqnn1 libqnn-dev qnn-tools)
+  local snpe_pkgs=(libsnpe1 libsnpe-dev snpe-tools)
+  for pkg in "${qnn_pkgs[@]}" "${snpe_pkgs[@]}"; do
+    apt-get install -y -qq "$pkg" 2>/dev/null || warn "Could not install ${pkg} — skipping"
+  done
 
   # ── Adreno GPU OpenCL ICD ──────────────────────────────────────────────────
   # Provides libOpenCL_adreno.so, libadreno_utils.so, and the adreno.icd
@@ -148,9 +196,9 @@ install_qcom_hw_stack() {
   # (cdsprpcd, adsprpcd) are pre-installed; ensure the userspace libs match.
   # qcom-property-vault — provides libpropertyvault.so which the Adreno OCL
   # ICD uses for Android-style system properties on Linux.
-  apt-get install -y -qq \
-    qcom-fastrpc1 qcom-fastrpc-dev \
-    qcom-property-vault || true
+  for pkg in qcom-fastrpc1 qcom-fastrpc-dev qcom-property-vault; do
+    apt-get install -y -qq "$pkg" 2>/dev/null || warn "Could not install ${pkg} — skipping"
+  done
 
   # ── Ensure FastRPC daemons are enabled and running ─────────────────────────
   # cdsprpcd handles CDSP (Hexagon 790 HTP/compute DSP).
@@ -169,7 +217,7 @@ install_qcom_hw_stack() {
     ocl-icd-opencl-dev \
     opencl-headers \
     opencl-clhpp-headers \
-    clinfo
+    clinfo || true
 
   # ── V4L2 / GStreamer tools ─────────────────────────────────────────────────
   # v4l-utils — v4l2-ctl, v4l2-compliance: inspect and test video devices
@@ -181,7 +229,7 @@ install_qcom_hw_stack() {
   apt-get install -y -qq \
     v4l-utils \
     gstreamer1.0-tools \
-    gstreamer1.0-plugins-bad
+    gstreamer1.0-plugins-bad || true
 
   # ── C++ build toolchain ────────────────────────────────────────────────────
   # Required to compile the hw_bench C++ benchmark on the node itself.
@@ -190,7 +238,7 @@ install_qcom_hw_stack() {
     cmake \
     build-essential \
     g++ \
-    libdrm-dev
+    libdrm-dev || true
 
   # ── libOpenCL.so linker symlink ─────────────────────────────────────────────
   # qcom-adreno1 ships libOpenCL.so.1 (the runtime) but NOT the bare linker
