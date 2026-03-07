@@ -152,24 +152,38 @@ SOURCES
   dpkg --configure -a 2>/dev/null || true
   apt-get -f install -y -qq 2>/dev/null || true
 
-  # The Rubik Pi base image ships linux-firmware-dragonwing which pegs itself
-  # to a specific linux-firmware version that may not yet be available in the
-  # Ubuntu repos.  Attempting to install or upgrade linux-firmware triggers an
-  # "unmet dependencies / held broken packages" failure that blocks ALL further
-  # apt operations on the node.  We hold linux-firmware at its current version
-  # so apt does not try to resolve that conflict during our install.
+  # The Rubik Pi base image ships linux-firmware-dragonwing which requires a
+  # specific linux-firmware version (e.g. 0ubuntu2.23) that may not yet be
+  # published to the standard ubuntu-ports repo (which only has 0ubuntu2.14).
+  # When ubuntu.sources is present, apt can see the older ubuntu-ports version
+  # and tries to "install" it as part of dependency resolution for other
+  # packages, which immediately conflicts with dragonwing's requirement.
+  #
+  # Solution: pin linux-firmware to never come from ubuntu-ports.  This tells
+  # apt to leave the currently-installed Thundercomm/Tangshan version alone.
+  # Using a preferences pin (not apt-mark hold) avoids the "held packages were
+  # changed" error that -y triggers when a held package is touched.
   if dpkg -l linux-firmware-dragonwing &>/dev/null; then
-    apt-mark hold linux-firmware 2>/dev/null || true
-    info "linux-firmware held at current version (avoids linux-firmware-dragonwing conflict)"
+    # Remove any legacy hold that previous script versions may have set
+    apt-mark unhold linux-firmware 2>/dev/null || true
+    cat > /etc/apt/preferences.d/rubikpi-firmware <<'PREF'
+# Prevent apt from installing linux-firmware from ubuntu-ports.
+# The Rubik Pi ships linux-firmware-dragonwing which requires a version of
+# linux-firmware from the Thundercomm/Tangshan repos only.  Pulling the
+# ubuntu-ports version would break the dragonwing dependency.
+Package: linux-firmware
+Pin: origin "ports.ubuntu.com"
+Pin-Priority: -1
+PREF
+    info "linux-firmware pinned away from ubuntu-ports (avoids linux-firmware-dragonwing conflict)"
   fi
 
   apt-get update -qq
 
   # ── Linux firmware ─────────────────────────────────────────────────────────
-  # The firmware blobs (Adreno, Hexagon HTP, msm_vidc) are already present in
-  # the Rubik Pi base image via linux-firmware-dragonwing.  We skip an explicit
-  # linux-firmware upgrade here to avoid the version-conflict described above.
-  # On boards that do NOT have linux-firmware-dragonwing, install it normally.
+  # Firmware blobs (Adreno, Hexagon HTP, msm_vidc) are already present via
+  # linux-firmware-dragonwing.  Only install linux-firmware explicitly on
+  # boards that don't have the dragonwing package.
   if ! dpkg -l linux-firmware-dragonwing &>/dev/null; then
     apt-get install -y -qq linux-firmware || true
   fi
