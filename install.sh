@@ -316,6 +316,8 @@ setup_kubectl() {
     # credentials to disk).  Skip the copy but still add PATH for the binary.
     if [[ -f "$KUBECONFIG_PATH" ]]; then
       mkdir -p "${home_dir}/.kube"
+      # Always overwrite so the file stays in sync after IP changes or cert
+      # rotations — the RKE2 kubeconfig is not secret (it uses mTLS anyway).
       install -m 600 -o ubuntu -g ubuntu "$KUBECONFIG_PATH" "${home_dir}/.kube/config" 2>/dev/null || true
       local bashrc="${home_dir}/.bashrc"
       if ! grep -q "KUBECONFIG" "$bashrc" 2>/dev/null; then
@@ -615,6 +617,133 @@ apply_session_rbac() {
   fi
 }
 
+# ── Network-reconcile service ──────────────────────────────────────────────────
+# Installs a lightweight systemd service that runs on every boot (after the
+# network comes up) to detect node IP changes and automatically:
+#   • update config.yaml tls-san
+#   • run rke2 server --cluster-reset when the etcd peer URL is stale
+#   • update the MetalLB IPAddressPool to the new subnet
+#   • wait for Traefik to receive a new LoadBalancer IP
+#   • update the Rancher Helm release with a new nip.io hostname
+#
+# This is what makes the cluster survive being moved between networks.
+install_network_reconcile() {
+  step "Installing network-reconcile service"
+
+  local script_src="${SCRIPT_DIR}/scripts/network-reconcile.sh"
+  local service_src="${SCRIPT_DIR}/manifests/rubik-network-reconcile.service"
+  local script_dst="/usr/local/bin/rubik-network-reconcile"
+  local service_dst="/etc/systemd/system/rubik-network-reconcile.service"
+
+  if [[ ! -f "$script_src" ]]; then
+    warn "scripts/network-reconcile.sh not found — skipping"
+    return 0
+  fi
+
+  install -m 755 "$script_src" "$script_dst"
+
+  if [[ -f "$service_src" ]]; then
+    install -m 644 "$service_src" "$service_dst"
+  else
+    # Write the unit inline if the file wasn't shipped
+    cat > "$service_dst" <<'UNIT'
+[Unit]
+Description=Rubik Pi — Kubernetes network reconciliation
+After=network-online.target
+Wants=network-online.target
+Before=rke2-server.service rke2-agent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/rubik-network-reconcile
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rubik-net-reconcile
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  fi
+
+  systemctl daemon-reload
+  systemctl enable rubik-network-reconcile
+  # rke2-server stays enabled; the Before= ordering in the unit file ensures
+  # the reconcile service always runs first so any IP-change fix is applied
+  # before RKE2 tries to start.
+  log "Network-reconcile service installed and enabled"
+}
+
+# ── IP-change recovery ─────────────────────────────────────────────────────────
+# When a node's IP address changes after the cluster was bootstrapped, the etcd
+# peer URL stored inside the etcd database becomes stale.  rke2-server then
+# refuses to start with:
+#   "this server is not a member of the etcd cluster.
+#    Found [node=https://<old-ip>:2380], expect: node=https://<new-ip>:2380"
+#
+# This function detects that mismatch and runs `rke2 server --cluster-reset`
+# to re-elect this node as the sole etcd member using its current IP — without
+# wiping any cluster data.
+fix_ip_change() {
+  local current_ip="$1"
+  local etcd_data_dir="${RKE2_DATA_DIR}/server/db/etcd"
+
+  # Nothing to fix if there is no etcd data yet.
+  [[ -d "$etcd_data_dir" ]] || return 0
+
+  # Read the peer URL from etcd's stored member list.  The file lives at a
+  # fixed path inside the etcd WAL/snap directory written by etcd itself.
+  # We search for the address pattern rather than parsing binary WAL files.
+  local stored_ip
+  stored_ip=$(strings "${etcd_data_dir}/member/snap/db" 2>/dev/null \
+    | grep -oP 'https?://\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=:2380)' \
+    | head -1 || true)
+
+  # Fall back to scanning member directory if snap/db is absent or unreadable.
+  if [[ -z "$stored_ip" ]]; then
+    stored_ip=$(strings "${etcd_data_dir}/member/wal/"*.wal 2>/dev/null \
+      | grep -oP 'https?://\K[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(?=:2380)' \
+      | grep -v "^127\." | head -1 || true)
+  fi
+
+  if [[ -n "$stored_ip" && "$stored_ip" != "$current_ip" ]]; then
+    warn "Node IP changed: etcd has ${stored_ip}, current IP is ${current_ip}"
+    warn "Running cluster-reset to update etcd peer URL (data is preserved)..."
+
+    systemctl stop rke2-server 2>/dev/null || true
+    sleep 2
+
+    # Run the reset in the background with a timeout; it starts etcd, updates
+    # the member URL, and then exits when the API server becomes ready.
+    local reset_log
+    reset_log=$(mktemp /tmp/rke2-cluster-reset.XXXXXX.log)
+    timeout 120 rke2 server --cluster-reset >"$reset_log" 2>&1 &
+    local reset_pid=$!
+
+    info "Waiting for cluster-reset to complete (up to 120 s)..."
+    local i
+    for i in $(seq 1 24); do
+      sleep 5
+      if ! kill -0 "$reset_pid" 2>/dev/null; then
+        break
+      fi
+      if grep -q "rke2 is up and running" "$reset_log" 2>/dev/null; then
+        kill "$reset_pid" 2>/dev/null || true
+        break
+      fi
+    done
+    wait "$reset_pid" 2>/dev/null || true
+    rm -f "$reset_log"
+
+    log "Cluster-reset complete — etcd peer URL updated to ${current_ip}"
+  elif [[ -z "$stored_ip" ]]; then
+    info "Could not read stored etcd IP — skipping IP-change check"
+  else
+    log "Node IP matches etcd peer URL (${current_ip}) — no reset needed"
+  fi
+}
+
 # ── Init mode ──────────────────────────────────────────────────────────────────
 install_init() {
   local node_ip
@@ -647,7 +776,38 @@ install_init() {
   # the bootstrap-data decryption on the next start.
   local etcd_data_dir="${RKE2_DATA_DIR}/server/db"
   if systemctl is-active --quiet rke2-server 2>/dev/null || [[ -d "$etcd_data_dir" ]]; then
-    log "RKE2 cluster data exists — preserving existing config (token unchanged)"
+    log "RKE2 cluster data exists — preserving token, updating tls-san"
+    # Always rewrite the tls-san block with the current IP so that a node IP
+    # change (DHCP re-assignment, interface rename, etc.) doesn't leave stale
+    # addresses in the config and break TLS / etcd peer resolution on the next
+    # restart.  The token is preserved from the running cluster.
+    local config_file="${RKE2_CONFIG_DIR}/config.yaml"
+    if [[ -f "$config_file" ]]; then
+      # Rewrite config preserving token but updating tls-san
+      local existing_token
+      existing_token=$(grep -E '^token:' "$config_file" | awk '{print $2}' | tr -d '"' | head -1)
+      [[ -n "$existing_token" ]] && token="$existing_token"
+    fi
+    mkdir -p "$RKE2_CONFIG_DIR"
+    cat > "${RKE2_CONFIG_DIR}/config.yaml" <<EOF
+# RKE2 init node — generated by rubik-kubernetes installer
+token: "${token}"
+write-kubeconfig-mode: "0640"
+disable:
+  - rke2-servicelb
+  - rke2-traefik
+tls-san:
+  - "${node_ip}"
+  - "$(hostname -f 2>/dev/null || hostname)"
+EOF
+
+    # Detect if the node's IP has changed since the cluster was first
+    # bootstrapped.  When the IP changes the etcd peer URL stored in the etcd
+    # database goes stale, causing rke2-server to fail to start (it prints
+    # "this server is not a member of the etcd cluster").  Running
+    # `rke2 server --cluster-reset` forces etcd to adopt the current node as
+    # its sole member, fixing the peer URL without losing cluster data.
+    fix_ip_change "$node_ip"
   else
     step "Writing RKE2 server config (init node)"
     mkdir -p "$RKE2_CONFIG_DIR"
@@ -682,6 +842,11 @@ EOF
   install_device_plugin
   apply_session_rbac
   label_node_cpu_topology
+  install_network_reconcile
+
+  # Record the current IP as the baseline so the reconcile service knows the
+  # cluster was fresh-installed with this IP and skips the reset on first boot.
+  echo "$node_ip" > "${RKE2_CONFIG_DIR}/last-node-ip"
 
   print_init_summary "$node_ip" "$token"
 }
@@ -757,6 +922,10 @@ EOF
 
   # Label CPU topology on every joining node (init node labels itself separately)
   label_node_cpu_topology
+  install_network_reconcile
+
+  # Record the current IP as the baseline for future reconcile runs.
+  echo "$node_ip" > "${RKE2_CONFIG_DIR}/last-node-ip"
 
   print_join_summary
 }

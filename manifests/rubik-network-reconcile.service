@@ -1,0 +1,23 @@
+[Unit]
+Description=Rubik Pi — Kubernetes network reconciliation
+Documentation=https://github.com/rubik-kuber
+# Run after the network has a routable address (covers both DHCP and static)
+After=network-online.target
+Wants=network-online.target
+# Must run before RKE2 so we can do a cluster-reset if the IP changed
+Before=rke2-server.service rke2-agent.service
+# If RKE2 is already up when we start (e.g. manual re-run), that is fine
+Conflicts=
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/rubik-network-reconcile
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rubik-net-reconcile
+# Give it up to 10 minutes (cluster-reset + API wait + Helm upgrade)
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
