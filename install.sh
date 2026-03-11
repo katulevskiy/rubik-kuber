@@ -5,7 +5,7 @@
 #   Init node (first Pi, bootstraps the cluster):
 #     sudo [METALLB_RANGE="192.168.1.200-192.168.1.220"] ./install.sh
 #
-#   Join node (all subsequent Pis — control plane by default):
+#   Join node (all subsequent Pis — worker by default):
 #     sudo CLUSTER_SERVER="https://<init-node-ip>:9345" \
 #          CLUSTER_TOKEN="<token-from-init-output>" \
 #          ./install.sh
@@ -19,7 +19,7 @@
 # Environment variables:
 #   CLUSTER_SERVER           — manual join server override
 #   CLUSTER_TOKEN            — manual join token override
-#   CLUSTER_ROLE             — "server" (default) or "agent"
+#   CLUSTER_ROLE             — join role override: "agent" (default) or "server"
 #   METALLB_RANGE            — IP range for MetalLB (init node only)
 #   AUTOJOIN_ADVERTISE_TOKEN — init-node discovery policy override ("yes" or "no")
 #   RANCHER_PASSWORD         — Rancher bootstrap password (default: rubikpi-admin)
@@ -39,7 +39,7 @@ step() { echo -e "\n${BOLD}${BLUE}── $* ──${NC}"; }
 # ── Configuration ──────────────────────────────────────────────────────────────
 CLUSTER_SERVER="${CLUSTER_SERVER:-}"
 CLUSTER_TOKEN="${CLUSTER_TOKEN:-}"
-CLUSTER_ROLE="${CLUSTER_ROLE:-server}"
+CLUSTER_ROLE="${CLUSTER_ROLE:-}"
 METALLB_RANGE="${METALLB_RANGE:-}"
 AUTOJOIN_ADVERTISE_TOKEN="${AUTOJOIN_ADVERTISE_TOKEN:-}"
 RANCHER_PASSWORD="${RANCHER_PASSWORD:-rubikpi-admin}"
@@ -123,6 +123,20 @@ detect_local_join_role() {
   else
     echo "server"
   fi
+}
+
+resolve_join_role() {
+  case "${CLUSTER_ROLE:-}" in
+    "")
+      printf '%s\n' "agent"
+      ;;
+    agent|server)
+      printf '%s\n' "${CLUSTER_ROLE}"
+      ;;
+    *)
+      err "CLUSTER_ROLE must be 'agent' or 'server'."
+      ;;
+  esac
 }
 
 parse_discovery_record_field() {
@@ -1505,6 +1519,7 @@ EOF
 
 # ── Join mode ──────────────────────────────────────────────────────────────────
 install_join() {
+  CLUSTER_ROLE="$(resolve_join_role)"
   [[ -n "$CLUSTER_TOKEN" ]] || err "CLUSTER_TOKEN is required when joining. Set it to the token printed by the init node."
 
   local node_ip

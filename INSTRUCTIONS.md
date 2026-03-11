@@ -113,7 +113,7 @@ Use this checklist when validating the install flows:
 | Fresh init node, interactive | `sudo ./install.sh` | Prompts for the advertisement policy, then bootstraps the first node |
 | Fresh init node, open advertisement | `sudo AUTOJOIN_ADVERTISE_TOKEN=yes ./install.sh` | Persists `open` mode and enables zero-config later-node joins |
 | Fresh init node, manual advertisement | `sudo AUTOJOIN_ADVERTISE_TOKEN=no ./install.sh` | Persists `manual` mode and requires explicit join credentials later |
-| Fresh later node, automatic join | `sudo ./install.sh` | Discovers the cluster and joins without manual env vars |
+| Fresh later node, automatic join | `sudo ./install.sh` | Discovers the cluster and joins as an `agent` without manual env vars |
 | Fresh later node, explicit manual join | `sudo CLUSTER_SERVER="https://<init-node-short-hostname>.local:9345" CLUSTER_TOKEN="<token>" ./install.sh` | Joins even if discovery is unavailable or manual-only |
 | Existing node after DHCP or subnet changes | `sudo ./install.sh` | Repairs local config and re-runs reconcile logic instead of re-bootstrapping |
 | Control-plane address drift | verify `<current-short-hostname>.local` resolves to the init node, then re-run `sudo ./install.sh` as needed | Discovery and cluster access recover without rebuilding the cluster |

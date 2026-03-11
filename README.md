@@ -130,8 +130,8 @@ new node that joins — no extra steps required.
 
 | Role | Command | When to use |
 |---|---|---|
-| `server` (default) | *(no extra flags)* | Control plane + etcd + workloads |
-| `agent` | `CLUSTER_ROLE=agent` | Pure worker, no etcd overhead |
+| `agent` (default for later joins) | *(no extra flags for later nodes)* | Pure worker, no etcd overhead |
+| `server` | `CLUSTER_ROLE=server` | Control plane + etcd + workloads |
 
 For **etcd HA** keep the total number of server nodes **odd** (1, 3, 5).
 For clusters with 4+ Pis, run 3 servers and add the rest as agents:
@@ -168,7 +168,7 @@ discovery.
 |---|---|---|
 | `CLUSTER_SERVER` | *(absent = auto-select mode)* | Manual join server override such as `https://<init-node-short-hostname>.local:9345` |
 | `CLUSTER_TOKEN` | — | Manual join token override from the init node |
-| `CLUSTER_ROLE` | `server` | `server` or `agent` |
+| `CLUSTER_ROLE` | `agent` for joins | Join-role override: `agent` or `server` |
 | `METALLB_RANGE` | *(auto-derived when unset)* | Free IP range on your LAN |
 | `AUTOJOIN_ADVERTISE_TOKEN` | *(prompted on first init bootstrap)* | `yes` = advertise raw token (`open`), `no` = advertise manual-only discovery |
 | `RANCHER_PASSWORD` | `rubikpi-admin` | Rancher bootstrap password |
@@ -206,7 +206,7 @@ Use this checklist when validating the auto-install / auto-rejoin flow:
 | Fresh first node, interactive | `sudo ./install.sh` | Auto-derives `METALLB_RANGE`, prompts for the init-node `AUTOJOIN_ADVERTISE_TOKEN` policy, then bootstraps the cluster |
 | Fresh first node, non-interactive open mode | `sudo AUTOJOIN_ADVERTISE_TOKEN=yes ./install.sh` | Boots without prompting for advertisement policy and publishes zero-config auto-join |
 | Fresh first node, non-interactive manual mode | `sudo AUTOJOIN_ADVERTISE_TOKEN=no ./install.sh` | Boots without prompting for advertisement policy and withholds the raw join token |
-| Fresh later node, zero-arg join | `sudo ./install.sh` | Discovers the cluster and joins automatically when the init node advertises `open` mode |
+| Fresh later node, zero-arg join | `sudo ./install.sh` | Discovers the cluster and joins automatically as an `agent` when the init node advertises `open` mode |
 | Fresh later node, manual fallback | `sudo CLUSTER_SERVER="https://<init-node-short-hostname>.local:9345" CLUSTER_TOKEN="<token>" ./install.sh` | Joins with explicit credentials even if discovery is unavailable or manual-only |
 | Existing node after network/IP change | `sudo ./install.sh` | Enters repair/reconcile mode and refreshes local config instead of bootstrapping a new cluster |
 | Control-plane IP change | `sudo ./install.sh` on the init node, then `sudo ./install.sh` on later nodes if needed | `<current-short-hostname>.local` discovery and cluster access recover without replacing the cluster |
