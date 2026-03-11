@@ -34,6 +34,90 @@ SDK available on the QCS6490 SoC.
 The `ubuntu` user gets a kubeconfig at `~/.kube/config` pointing at
 `/etc/rancher/rke2/rke2.yaml`.
 
+On the first init-node bootstrap, `install.sh` also chooses the LAN discovery
+advertisement policy for later auto-join work:
+
+```text
+Advertise raw join token over LAN for zero-config auto-join? [Y/n]
+```
+
+Enter or `Y` selects `open`, which advertises the raw join token in the staged
+discovery record. `n` selects `manual`, which advertises the cluster without the
+token. The chosen mode is persisted at `/etc/rancher/rke2/autojoin-mode`, and
+you can override it non-interactively with `AUTOJOIN_ADVERTISE_TOKEN=yes` or
+`AUTOJOIN_ADVERTISE_TOKEN=no` when bootstrapping the init node. If the first
+bootstrap runs without an interactive TTY, this override is required.
+
+### Auto-install decision flow
+
+On a fresh first node, the normal bootstrap path is:
+
+```bash
+sudo ./install.sh
+```
+
+On a fresh later node on the same LAN, the normal join path is also:
+
+```bash
+sudo ./install.sh
+```
+
+The installer decides what to do in this order:
+
+1. If `CLUSTER_SERVER` and `CLUSTER_TOKEN` are set, perform an explicit manual join.
+2. Otherwise, if this node already has an RKE2 install, run local repair/reconcile.
+3. Otherwise, try LAN discovery and auto-join if the init node is advertising `open` mode.
+4. If no cluster is discoverable, bootstrap a new init node.
+
+Manual join remains the fallback whenever discovery is unavailable, the init node is
+advertising `manual` mode, or the LAN has multiple visible clusters:
+
+```bash
+sudo CLUSTER_SERVER="https://<init-node-short-hostname>.local:9345" \
+     CLUSTER_TOKEN="<token>" \
+     ./install.sh
+```
+
+### Discovery assumptions
+
+The zero-argument workflow depends on these assumptions:
+
+- all nodes are on the same local broadcast domain
+- Avahi/mDNS is available and working on that LAN segment
+- exactly one Rubik cluster is visible in discovery
+
+If any assumption is false, use the explicit env vars instead of discovery.
+
+### Reconcile behavior and IP changes
+
+`install.sh` is intentionally safe to re-run:
+
+```bash
+sudo ./install.sh
+```
+
+On an already-installed node, that enters repair/reconcile mode instead of creating a
+new cluster. The reconcile flow rechecks the local node IP, refreshes the advertised
+control-plane endpoint, and re-applies cluster-facing configuration that depends on the
+server address. The intended steady-state endpoint is
+`<current-short-hostname>.local`, so later nodes can keep joining or reconnecting
+without pinning a DHCP lease. For example, a node whose short hostname is `rubikpi`
+would advertise `rubikpi.local`.
+
+### Verification checklist
+
+Use this checklist when validating the install flows:
+
+| Scenario | Command | Expected result |
+|---|---|---|
+| Fresh init node, interactive | `sudo ./install.sh` | Prompts for the advertisement policy, then bootstraps the first node |
+| Fresh init node, open advertisement | `sudo AUTOJOIN_ADVERTISE_TOKEN=yes ./install.sh` | Persists `open` mode and enables zero-config later-node joins |
+| Fresh init node, manual advertisement | `sudo AUTOJOIN_ADVERTISE_TOKEN=no ./install.sh` | Persists `manual` mode and requires explicit join credentials later |
+| Fresh later node, automatic join | `sudo ./install.sh` | Discovers the cluster and joins without manual env vars |
+| Fresh later node, explicit manual join | `sudo CLUSTER_SERVER="https://<init-node-short-hostname>.local:9345" CLUSTER_TOKEN="<token>" ./install.sh` | Joins even if discovery is unavailable or manual-only |
+| Existing node after DHCP or subnet changes | `sudo ./install.sh` | Repairs local config and re-runs reconcile logic instead of re-bootstrapping |
+| Control-plane address drift | verify `<current-short-hostname>.local` resolves to the init node, then re-run `sudo ./install.sh` as needed | Discovery and cluster access recover without rebuilding the cluster |
+
 ```bash
 # Verify cluster is up
 kubectl get nodes

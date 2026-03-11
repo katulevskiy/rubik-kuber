@@ -35,9 +35,24 @@ sudo apt install linux-firmware
 git clone https://github.com/your-org/rubik-kubernetes.git
 cd rubik-kubernetes
 
-# Bootstrap the cluster (prompts for MetalLB IP range if not set)
+# Bootstrap the cluster
 sudo ./install.sh
 ```
+
+On a brand-new init node, `install.sh` also asks whether to advertise the raw join
+token over LAN for zero-config auto-join:
+
+```text
+Advertise raw join token over LAN for zero-config auto-join? [Y/n]
+```
+
+Press Enter or answer `Y` to advertise in `open` mode, or answer `n` to keep LAN
+discovery in `manual` mode. The selected mode is persisted at
+`/etc/rancher/rke2/autojoin-mode`.
+
+For non-interactive first bootstrap runs, set `AUTOJOIN_ADVERTISE_TOKEN=yes` or
+`AUTOJOIN_ADVERTISE_TOKEN=no` explicitly. The installer now fails closed instead
+of defaulting the policy when no TTY is available.
 
 At the end the script prints the Rancher URL and the join command for additional nodes.
 
@@ -45,13 +60,27 @@ At the end the script prints the Rancher URL and the join command for additional
 
 ## Multi-Node Cluster
 
-Run the **same script** on every Pi. The only difference is the environment variables.
+Run the **same script** on every Pi. Later nodes can usually just run `sudo ./install.sh`
+with no join env vars when the init node advertises discovery in `open` mode.
 
 ### Step 1 — Init node (first Pi)
 
+Default interactive bootstrap:
+
 ```bash
-# Optional: set MetalLB range as an env var to skip the prompt
-sudo METALLB_RANGE="192.168.1.200-192.168.1.220" ./install.sh
+sudo ./install.sh
+```
+
+That first init-node run installs the cluster, auto-derives `METALLB_RANGE` when
+unset, and asks whether the raw join token may be advertised on the LAN.
+
+Non-interactive bootstrap example:
+
+```bash
+# Optional: set both env vars to skip prompts on first bootstrap
+sudo METALLB_RANGE="192.168.1.200-192.168.1.220" \
+     AUTOJOIN_ADVERTISE_TOKEN=yes \
+     ./install.sh
 ```
 
 When it completes you will see output like:
@@ -76,7 +105,17 @@ When it completes you will see output like:
 
 ### Step 2 — Join additional Pis
 
-Copy the join command from the init node output and run it on every other Pi:
+Default path when the init node uses discovery `open` mode:
+
+```bash
+sudo ./install.sh
+```
+
+If the discovered cluster advertises `manual` mode instead, the installer prints the
+discovered `CLUSTER_SERVER` value and stops until you provide explicit join env vars.
+
+Manual override path on any node, including when discovery is unavailable or when you
+want to bypass discovery entirely:
 
 ```bash
 sudo CLUSTER_SERVER="https://192.168.1.10:9345" \
@@ -110,15 +149,67 @@ sudo CLUSTER_SERVER="..." CLUSTER_TOKEN="..." CLUSTER_ROLE=agent ./install.sh
 
 ---
 
+## Auto-Install Assumptions
+
+The zero-argument `sudo ./install.sh` flow assumes:
+
+- all Pis are on the same local broadcast domain
+- Avahi/mDNS discovery is available on that LAN segment
+- only one Rubik cluster is visible to discovery at a time
+
+If those assumptions are not true, use the manual join env vars instead of relying on
+discovery.
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `CLUSTER_SERVER` | *(absent = init mode)* | `https://<init-node-ip>:9345` |
-| `CLUSTER_TOKEN` | — | Token printed by the init node |
+| `CLUSTER_SERVER` | *(absent = auto-select mode)* | Manual join server override such as `https://<init-node-short-hostname>.local:9345` |
+| `CLUSTER_TOKEN` | — | Manual join token override from the init node |
 | `CLUSTER_ROLE` | `server` | `server` or `agent` |
-| `METALLB_RANGE` | *(prompted)* | Free IP range on your LAN |
+| `METALLB_RANGE` | *(auto-derived when unset)* | Free IP range on your LAN |
+| `AUTOJOIN_ADVERTISE_TOKEN` | *(prompted on first init bootstrap)* | `yes` = advertise raw token (`open`), `no` = advertise manual-only discovery |
 | `RANCHER_PASSWORD` | `rubikpi-admin` | Rancher bootstrap password |
+
+---
+
+## Repair And IP-Change Self-Healing
+
+Once a node has already been installed, re-running:
+
+```bash
+sudo ./install.sh
+```
+
+does not create a second cluster. The installer switches to local repair/reconcile
+mode, refreshes the node's local configuration, and re-installs the reconcile service.
+
+The control-plane endpoint is advertised as
+`<current-short-hostname>.local` on the init node, so later nodes do not need to
+hard-code a DHCP address. For example, a node whose short hostname is
+`rubikpi` would advertise `rubikpi.local`. If the init node IP changes, the
+reconcile flow updates the local RKE2 server address, re-publishes the LAN
+discovery record, and re-applies the cluster-facing bits that depend on the
+node IP. Re-running `sudo ./install.sh` is also a safe manual recovery step
+after network changes.
+
+---
+
+## Verification Matrix
+
+Use this checklist when validating the auto-install / auto-rejoin flow:
+
+| Scenario | Command | Expected result |
+|---|---|---|
+| Fresh first node, interactive | `sudo ./install.sh` | Auto-derives `METALLB_RANGE`, prompts for the init-node `AUTOJOIN_ADVERTISE_TOKEN` policy, then bootstraps the cluster |
+| Fresh first node, non-interactive open mode | `sudo AUTOJOIN_ADVERTISE_TOKEN=yes ./install.sh` | Boots without prompting for advertisement policy and publishes zero-config auto-join |
+| Fresh first node, non-interactive manual mode | `sudo AUTOJOIN_ADVERTISE_TOKEN=no ./install.sh` | Boots without prompting for advertisement policy and withholds the raw join token |
+| Fresh later node, zero-arg join | `sudo ./install.sh` | Discovers the cluster and joins automatically when the init node advertises `open` mode |
+| Fresh later node, manual fallback | `sudo CLUSTER_SERVER="https://<init-node-short-hostname>.local:9345" CLUSTER_TOKEN="<token>" ./install.sh` | Joins with explicit credentials even if discovery is unavailable or manual-only |
+| Existing node after network/IP change | `sudo ./install.sh` | Enters repair/reconcile mode and refreshes local config instead of bootstrapping a new cluster |
+| Control-plane IP change | `sudo ./install.sh` on the init node, then `sudo ./install.sh` on later nodes if needed | `<current-short-hostname>.local` discovery and cluster access recover without replacing the cluster |
 
 ---
 

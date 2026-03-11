@@ -17,10 +17,11 @@
 #          ./install.sh
 #
 # Environment variables:
-#   CLUSTER_SERVER           — set when joining; absent = init mode
-#   CLUSTER_TOKEN            — required when joining
+#   CLUSTER_SERVER           — manual join server override
+#   CLUSTER_TOKEN            — manual join token override
 #   CLUSTER_ROLE             — "server" (default) or "agent"
 #   METALLB_RANGE            — IP range for MetalLB (init node only)
+#   AUTOJOIN_ADVERTISE_TOKEN — init-node discovery policy override ("yes" or "no")
 #   RANCHER_PASSWORD         — Rancher bootstrap password (default: rubikpi-admin)
 
 set -euo pipefail
@@ -40,6 +41,7 @@ CLUSTER_SERVER="${CLUSTER_SERVER:-}"
 CLUSTER_TOKEN="${CLUSTER_TOKEN:-}"
 CLUSTER_ROLE="${CLUSTER_ROLE:-server}"
 METALLB_RANGE="${METALLB_RANGE:-}"
+AUTOJOIN_ADVERTISE_TOKEN="${AUTOJOIN_ADVERTISE_TOKEN:-}"
 RANCHER_PASSWORD="${RANCHER_PASSWORD:-rubikpi-admin}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -47,6 +49,18 @@ RKE2_CONFIG_DIR="/etc/rancher/rke2"
 RKE2_DATA_DIR="/var/lib/rancher/rke2"
 KUBECONFIG_PATH="${RKE2_CONFIG_DIR}/rke2.yaml"
 RKE2_KUBECTL="${RKE2_DATA_DIR}/bin/kubectl"
+CLUSTER_DISCOVERY_HELPERS="${SCRIPT_DIR}/scripts/cluster-discovery.sh"
+CLUSTER_DISCOVERY_INSTALL_BIN="/usr/local/bin/rubik-cluster-discovery"
+CLUSTER_DISCOVERY_SERVICE_SRC="${SCRIPT_DIR}/manifests/rubik-cluster-advertise.service"
+CLUSTER_DISCOVERY_SERVICE_DST="/etc/systemd/system/rubik-cluster-advertise.service"
+CLUSTER_DISCOVERY_ENV_DST="/etc/default/rubik-cluster-advertise"
+CLUSTER_DISCOVERY_AVAHI_DST="/etc/avahi/services/rubik-cluster.service"
+AUTOJOIN_MODE_PATH="${RKE2_CONFIG_DIR}/autojoin-mode"
+
+if [[ -f "${CLUSTER_DISCOVERY_HELPERS}" ]]; then
+  # shellcheck source=/dev/null
+  . "${CLUSTER_DISCOVERY_HELPERS}"
+fi
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 require_root() {
@@ -78,6 +92,379 @@ generate_token() {
     openssl rand -hex 32
   else
     tr -dc 'a-f0-9' < /dev/urandom | head -c 64
+  fi
+}
+
+have_local_rke2_install() {
+  [[ -d "${RKE2_DATA_DIR}" || -f "${RKE2_CONFIG_DIR}/config.yaml" ]]
+}
+
+read_rke2_config_value() {
+  local key="$1"
+  local config_file="${RKE2_CONFIG_DIR}/config.yaml"
+
+  [[ -f "${config_file}" ]] || return 1
+
+  awk -F': ' -v key="${key}" '
+    $1 == key {
+      value = $2
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      gsub(/^"/, "", value)
+      gsub(/"$/, "", value)
+      print value
+      exit
+    }
+  ' "${config_file}"
+}
+
+detect_local_join_role() {
+  if systemctl list-unit-files --type=service --full 2>/dev/null | awk '$1 == "rke2-agent.service" { found=1 } END { exit(found ? 0 : 1) }'; then
+    echo "agent"
+  else
+    echo "server"
+  fi
+}
+
+parse_discovery_record_field() {
+  local record="$1"
+  local field_name="$2"
+
+  if declare -F extract_discovery_record_field >/dev/null 2>&1; then
+    extract_discovery_record_field "${record}" "${field_name}"
+    return
+  fi
+
+  printf '%s\n' "${record}" | awk -F';' -v key="${field_name}" '
+    {
+      for (i = 10; i <= NF; i++) {
+        split($i, pair, "=")
+        if (pair[1] == key) {
+          value = substr($i, length(key) + 2)
+          gsub(/^"/, "", value)
+          gsub(/"$/, "", value)
+          print value
+          exit
+        }
+      }
+    }
+  '
+}
+
+inspect_discovery_candidate() {
+  declare -F discover_cluster_records >/dev/null 2>&1 || {
+    printf '%s\n' "unavailable"
+    printf '\n'
+    return 0
+  }
+
+  local records unique_records resolved_count record server_host server_port mode token
+  if ! records="$(discover_cluster_records 2>/dev/null)"; then
+    printf '%s\n' "runtime-failure"
+    printf '\n'
+    return 0
+  fi
+
+  if [[ -z "${records}" ]]; then
+    printf '%s\n' "none"
+    printf '\n'
+    return 0
+  fi
+
+  if declare -F unique_discovery_records >/dev/null 2>&1; then
+    unique_records="$(unique_discovery_records "${records}" || true)"
+  else
+    unique_records="$(printf '%s\n' "${records}" | awk -F';' '$1 == "=" { print }')"
+  fi
+
+  resolved_count="$(printf '%s\n' "${unique_records}" | awk 'NF { count++ } END { print count + 0 }')"
+
+  if [[ "${resolved_count}" -eq 0 ]]; then
+    printf '%s\n' "invalid"
+    printf '\n'
+    return 0
+  fi
+
+  if [[ "${resolved_count}" -gt 1 ]]; then
+    printf '%s\n' "multiple"
+    printf '\n'
+    return 0
+  fi
+
+  record="$(printf '%s\n' "${unique_records}" | awk 'NF { print; exit }')"
+  [[ -n "${record}" ]] || {
+    printf '%s\n' "invalid"
+    printf '\n'
+    return 0
+  }
+
+  server_host="$(parse_discovery_record_field "${record}" "server_host")"
+  server_port="$(parse_discovery_record_field "${record}" "server_port")"
+  mode="$(parse_discovery_record_field "${record}" "mode")"
+  token="$(parse_discovery_record_field "${record}" "token")"
+
+  if [[ -z "${server_host}" || -z "${server_port}" || -z "${mode}" ]]; then
+    printf '%s\n' "invalid"
+    printf '%s\n' "${record}"
+    return 0
+  fi
+
+  case "${mode}" in
+    open)
+      if [[ -z "${token}" ]]; then
+        printf '%s\n' "invalid"
+        printf '%s\n' "${record}"
+        return 0
+      fi
+      ;;
+    manual)
+      ;;
+    *)
+      printf '%s\n' "invalid"
+      printf '%s\n' "${record}"
+      return 0
+      ;;
+  esac
+
+  printf '%s\n' "${mode}"
+  printf '%s\n' "${record}"
+}
+
+discovered_join_candidate() {
+  local discovery_info=()
+  local discovery_state=""
+  local record=""
+
+  mapfile -t discovery_info < <(inspect_discovery_candidate)
+  discovery_state="${discovery_info[0]:-invalid}"
+  record="${discovery_info[1]:-}"
+
+  case "${discovery_state}" in
+    open|manual)
+      printf '%s\n' "${record}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+load_autojoin_from_discovery() {
+  local discovery_info=()
+  local discovery_state=""
+  local record=""
+  local server_host=""
+  local server_port=""
+  local token=""
+
+  mapfile -t discovery_info < <(inspect_discovery_candidate)
+  discovery_state="${discovery_info[0]:-invalid}"
+  record="${discovery_info[1]:-}"
+
+  case "${discovery_state}" in
+    open|manual)
+      ;;
+    multiple)
+      err "Multiple cluster discovery candidates found on the LAN. Refusing to guess; re-run with CLUSTER_SERVER and CLUSTER_TOKEN."
+      ;;
+    invalid)
+      err "Discovered cluster advertisement is malformed or incomplete. Refusing to guess; fix discovery or re-run with CLUSTER_SERVER and CLUSTER_TOKEN."
+      ;;
+    runtime-failure)
+      err "Cluster discovery browsing failed at runtime. Refusing to guess; fix Avahi/discovery or re-run with CLUSTER_SERVER and CLUSTER_TOKEN."
+      ;;
+    unavailable)
+      err "Cluster discovery helper is unavailable. Refusing to guess; re-run with CLUSTER_SERVER and CLUSTER_TOKEN."
+      ;;
+    none)
+      err "No cluster discovery candidate is currently visible on the LAN."
+      ;;
+    *)
+      err "Unsupported discovery state: ${discovery_state}"
+      ;;
+  esac
+
+  server_host="$(parse_discovery_record_field "${record}" "server_host")"
+  server_port="$(parse_discovery_record_field "${record}" "server_port")"
+  [[ -n "${server_host}" && -n "${server_port}" ]] || \
+    err "Discovered cluster advertisement is missing server metadata."
+
+  CLUSTER_SERVER="https://${server_host}:${server_port}"
+
+  case "${discovery_state}" in
+    open)
+      token="$(parse_discovery_record_field "${record}" "token")"
+      [[ -n "${token}" ]] || err "Discovered open-join advertisement is missing its token."
+      CLUSTER_TOKEN="${token}"
+      ;;
+    manual)
+      CLUSTER_TOKEN=""
+      ;;
+  esac
+
+  AUTOJOIN_DISCOVERY_MODE="${discovery_state}"
+}
+
+read_persisted_autojoin_mode() {
+  local persisted_mode=""
+
+  [[ -f "${AUTOJOIN_MODE_PATH}" ]] || return 1
+  persisted_mode="$(tr -d '[:space:]' < "${AUTOJOIN_MODE_PATH}")"
+
+  case "${persisted_mode}" in
+    open|manual)
+      printf '%s\n' "${persisted_mode}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+read_key_value_file_value() {
+  local file_path="$1"
+  local key="$2"
+
+  [[ -f "${file_path}" ]] || return 1
+
+  awk -F'=' -v key="${key}" '
+    $1 == key {
+      value = substr($0, index($0, "=") + 1)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      gsub(/^"/, "", value)
+      gsub(/"$/, "", value)
+      print value
+      exit
+    }
+  ' "${file_path}"
+}
+
+read_staged_autojoin_mode() {
+  local staged_mode=""
+
+  staged_mode="$(read_key_value_file_value "${CLUSTER_DISCOVERY_ENV_DST}" "DISCOVERY_ADVERTISE_MODE" || true)"
+
+  case "${staged_mode}" in
+    open|manual)
+      printf '%s\n' "${staged_mode}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+persist_autojoin_mode() {
+  local mode="$1"
+
+  case "${mode}" in
+    open|manual)
+      ;;
+    *)
+      err "Unsupported auto-join advertisement mode: ${mode}"
+      ;;
+  esac
+
+  mkdir -p "${RKE2_CONFIG_DIR}"
+  printf '%s\n' "${mode}" > "${AUTOJOIN_MODE_PATH}"
+}
+
+resolve_init_advertisement_mode() {
+  local init_context="$1"
+  local mode=""
+  local prompt_reply=""
+
+  case "${init_context}" in
+    bootstrap|existing|repair)
+      ;;
+    *)
+      err "Unsupported init advertisement context: ${init_context}"
+      ;;
+  esac
+
+  if [[ -n "${AUTOJOIN_ADVERTISE_TOKEN}" ]]; then
+    case "${AUTOJOIN_ADVERTISE_TOKEN}" in
+      yes)
+        mode="open"
+        ;;
+      no)
+        mode="manual"
+        ;;
+      *)
+        err "AUTOJOIN_ADVERTISE_TOKEN must be 'yes' or 'no'."
+        ;;
+    esac
+  elif [[ "${init_context}" == "bootstrap" ]]; then
+    [[ -t 0 && -t 1 ]] || \
+      err "Fresh init bootstrap requires AUTOJOIN_ADVERTISE_TOKEN=yes|no when no interactive TTY is available."
+
+    while true; do
+      IFS= read -r -p "Advertise raw join token over LAN for zero-config auto-join? [Y/n] " prompt_reply || \
+        err "Fresh init bootstrap requires AUTOJOIN_ADVERTISE_TOKEN=yes|no when interactive input is unavailable."
+
+      case "${prompt_reply}" in
+        ""|[Yy]|[Yy][Ee][Ss])
+          mode="open"
+          break
+          ;;
+        [Nn]|[Nn][Oo])
+          mode="manual"
+          break
+          ;;
+        *)
+          warn "Please answer Y or n."
+          ;;
+      esac
+    done
+  else
+    mode="$(read_persisted_autojoin_mode || true)"
+    [[ -n "${mode}" ]] || mode="$(read_staged_autojoin_mode || true)"
+    [[ -n "${mode}" ]] || mode="manual"
+  fi
+
+  persist_autojoin_mode "${mode}"
+  printf '%s\n' "${mode}"
+}
+
+select_install_mode() {
+  local discovery_info=()
+  local discovery_state=""
+
+  if [[ -n "${CLUSTER_SERVER}" || -n "${CLUSTER_TOKEN}" ]]; then
+    [[ -n "${CLUSTER_SERVER}" && -n "${CLUSTER_TOKEN}" ]] || \
+      err "Set both CLUSTER_SERVER and CLUSTER_TOKEN for manual join."
+    echo "manual-join"
+  elif have_local_rke2_install; then
+    echo "repair"
+  else
+    mapfile -t discovery_info < <(inspect_discovery_candidate)
+    discovery_state="${discovery_info[0]:-invalid}"
+
+    case "${discovery_state}" in
+      open)
+        echo "auto-join-open"
+        ;;
+      manual)
+        echo "auto-join-manual"
+        ;;
+      none)
+        echo "init"
+        ;;
+      multiple)
+        err "Multiple cluster discovery candidates found on the LAN. Refusing to guess; re-run with CLUSTER_SERVER and CLUSTER_TOKEN."
+        ;;
+      invalid)
+        err "Discovered cluster advertisement is malformed or incomplete. Refusing to guess; fix discovery or re-run with CLUSTER_SERVER and CLUSTER_TOKEN."
+        ;;
+      runtime-failure)
+        err "Cluster discovery browsing failed at runtime. Refusing to guess; fix Avahi/discovery or re-run with CLUSTER_SERVER and CLUSTER_TOKEN."
+        ;;
+      unavailable)
+        err "Cluster discovery helper is unavailable. Refusing to guess; re-run with CLUSTER_SERVER and CLUSTER_TOKEN."
+        ;;
+      *)
+        err "Unsupported discovery state: ${discovery_state}"
+        ;;
+    esac
   fi
 }
 
@@ -272,12 +659,24 @@ prepare_system() {
   # open-iscsi + iscsid: required by Longhorn for block storage
   # nfs-common: required by Longhorn for backup NFS targets
   # util-linux: provides findmnt/blkid used by Longhorn
-  apt-get install -y -qq curl openssl open-iscsi nfs-common util-linux
+  # avahi-daemon + avahi-utils + libnss-mdns: advertise, browse, and resolve .local
+  # discovery endpoints on fresh images without requiring manual NSS edits.
+  apt-get install -y -qq curl openssl open-iscsi nfs-common util-linux avahi-daemon avahi-utils libnss-mdns
 
   # Enable iscsid — Longhorn requires it to be running on every node
   systemctl enable iscsid 2>/dev/null || true
   systemctl start  iscsid 2>/dev/null || true
   log "iSCSI daemon enabled and started"
+
+  # Avahi provides the LAN discovery runtime used by later auto-join tasks.
+  systemctl enable avahi-daemon.service avahi-daemon.socket 2>/dev/null || true
+  systemctl start avahi-daemon.socket 2>/dev/null || true
+  systemctl start avahi-daemon.service 2>/dev/null || true
+  log "Avahi runtime enabled and started"
+
+  if declare -F ensure_local_mdns_resolution >/dev/null 2>&1; then
+    ensure_local_mdns_resolution || warn "Could not update nsswitch.conf for .local name resolution"
+  fi
 
   # ── Swap ──
   # Kubernetes requires swap off for predictable resource management
@@ -331,6 +730,7 @@ EOF
     ufw allow 2380/tcp  comment 'etcd peer'                       2>/dev/null
     ufw allow 7946/tcp  comment 'MetalLB memberlist'              2>/dev/null
     ufw allow 7946/udp  comment 'MetalLB memberlist'              2>/dev/null
+    ufw allow 5353/udp  comment 'mDNS / Avahi discovery'          2>/dev/null
     ufw allow 80/tcp    comment 'HTTP ingress (Traefik)'          2>/dev/null
     ufw allow 443/tcp   comment 'HTTPS ingress (Traefik)'         2>/dev/null
     ufw reload 2>/dev/null || true
@@ -768,6 +1168,73 @@ UNIT
   log "Network-reconcile service installed and enabled"
 }
 
+install_cluster_discovery_runtime() {
+  step "Installing cluster discovery runtime"
+
+  if [[ ! -f "${CLUSTER_DISCOVERY_HELPERS}" ]]; then
+    warn "scripts/cluster-discovery.sh not found — skipping"
+    return 0
+  fi
+
+  install -m 755 "${CLUSTER_DISCOVERY_HELPERS}" "${CLUSTER_DISCOVERY_INSTALL_BIN}"
+  if declare -F ensure_avahi_physical_interface_binding >/dev/null 2>&1; then
+    ensure_avahi_physical_interface_binding || warn "Could not bind Avahi to the detected physical interface"
+  fi
+  log "Cluster discovery helper installed for LAN browse/reconcile"
+}
+
+install_cluster_discovery() {
+  local advertise_mode="${1:-manual}"
+  local advertise_token="${2:-}"
+  step "Installing cluster discovery scaffolding"
+
+  install_cluster_discovery_runtime
+
+  if [[ ! -f "${CLUSTER_DISCOVERY_SERVICE_SRC}" ]]; then
+    warn "manifests/rubik-cluster-advertise.service not found — skipping advertisement activation"
+    return 0
+  fi
+
+  local short_hostname
+  short_hostname=$(hostname -s 2>/dev/null || hostname)
+
+  case "${advertise_mode}" in
+    open)
+      [[ -n "${advertise_token}" ]] || err "Open auto-join advertisement requires a token."
+      ;;
+    manual)
+      advertise_token=""
+      ;;
+    *)
+      err "Unsupported cluster discovery advertisement mode: ${advertise_mode}"
+      ;;
+  esac
+
+  install -m 644 "${CLUSTER_DISCOVERY_SERVICE_SRC}" "${CLUSTER_DISCOVERY_SERVICE_DST}"
+
+  mkdir -p "$(dirname "${CLUSTER_DISCOVERY_ENV_DST}")"
+  cat > "${CLUSTER_DISCOVERY_ENV_DST}" <<EOF
+# Rubik cluster advertisement policy.
+DISCOVERY_ADVERTISE_MODE=${advertise_mode}
+DISCOVERY_ADVERTISE_TOKEN=${advertise_token}
+DISCOVERY_ADVERTISE_HOSTNAME=${short_hostname}
+DISCOVERY_AVAHI_SERVICE_PATH=${CLUSTER_DISCOVERY_AVAHI_DST}
+EOF
+
+  DISCOVERY_ADVERTISE_MODE="${advertise_mode}" \
+  DISCOVERY_ADVERTISE_TOKEN="${advertise_token}" \
+  DISCOVERY_ADVERTISE_HOSTNAME="${short_hostname}" \
+  DISCOVERY_AVAHI_SERVICE_PATH="${CLUSTER_DISCOVERY_AVAHI_DST}" \
+    "${CLUSTER_DISCOVERY_INSTALL_BIN}" advertise-service >/dev/null
+
+  systemctl daemon-reload
+  systemctl enable rubik-cluster-advertise
+  systemctl start rubik-cluster-advertise
+  systemctl reload-or-restart avahi-daemon
+  log "Cluster discovery advertisement mode: ${advertise_mode}"
+  log "Cluster discovery helper and Avahi advertisement runtime installed"
+}
+
 # ── IP-change recovery ─────────────────────────────────────────────────────────
 # When a node's IP address changes after the cluster was bootstrapped, the etcd
 # peer URL stored inside the etcd database becomes stale.  rke2-server then
@@ -839,7 +1306,18 @@ fix_ip_change() {
 
 # ── Init mode ──────────────────────────────────────────────────────────────────
 install_init() {
+  local init_context="${1:-bootstrap}"
   local node_ip
+  local autojoin_mode
+
+  case "${init_context}" in
+    bootstrap|existing|repair)
+      ;;
+    *)
+      err "Unsupported install_init context: ${init_context}"
+      ;;
+  esac
+
   node_ip=$(detect_node_ip) || err "Cannot detect node IP — is the network configured?"
   log "Node IP: ${node_ip}"
 
@@ -878,6 +1356,8 @@ install_init() {
   # re-run after a manual service stop doesn't regenerate the token and break
   # the bootstrap-data decryption on the next start.
   local etcd_data_dir="${RKE2_DATA_DIR}/server/db"
+  autojoin_mode="$(resolve_init_advertisement_mode "${init_context}")"
+
   if systemctl is-active --quiet rke2-server 2>/dev/null || [[ -d "$etcd_data_dir" ]]; then
     log "RKE2 cluster data exists — preserving token, updating tls-san"
     # Always rewrite the tls-san block with the current IP so that a node IP
@@ -956,6 +1436,7 @@ EOF
   apply_session_rbac
   label_node_cpu_topology
   install_network_reconcile
+  install_cluster_discovery "${autojoin_mode}" "${token}"
 
   # Record the current IP as the baseline so the reconcile service knows the
   # cluster was fresh-installed with this IP and skips the reset on first boot.
@@ -1040,12 +1521,101 @@ EOF
 
   # Label CPU topology on every joining node (init node labels itself separately)
   label_node_cpu_topology
+  install_cluster_discovery_runtime
   install_network_reconcile
 
   # Record the current IP as the baseline for future reconcile runs.
   echo "$node_ip" > "${RKE2_CONFIG_DIR}/last-node-ip"
 
   print_join_summary
+}
+
+repair_joined_node() {
+  [[ -n "${CLUSTER_SERVER}" ]] || err "Joined-node repair requires an existing server endpoint."
+  [[ -n "${CLUSTER_TOKEN}" ]] || err "Joined-node repair requires an existing token."
+
+  local node_ip
+  node_ip=$(detect_node_ip) || err "Cannot detect node IP"
+
+  local rke2_type
+  [[ "${CLUSTER_ROLE}" == "agent" ]] && rke2_type="agent" || rke2_type="server"
+
+  step "Refreshing RKE2 ${rke2_type} config for joined-node repair"
+  mkdir -p "${RKE2_CONFIG_DIR}"
+  local _short_hn _fqdn
+  _short_hn=$(hostname -s 2>/dev/null || hostname)
+  _fqdn=$(hostname -f 2>/dev/null || hostname)
+  cat > "${RKE2_CONFIG_DIR}/config.yaml" <<EOF
+# RKE2 join node — generated by rubik-kubernetes installer
+server: "${CLUSTER_SERVER}"
+token: "${CLUSTER_TOKEN}"
+write-kubeconfig-mode: "0640"
+tls-san:
+  - "${node_ip}"
+  - "${_short_hn}"
+  - "${_short_hn}.local"
+  - "${_fqdn}"
+EOF
+
+  install_rke2 "${rke2_type}"
+  setup_kubectl
+  install_cluster_discovery_runtime
+  install_network_reconcile
+
+  local reconcile_cmd="/usr/local/bin/rubik-network-reconcile"
+  if [[ ! -x "${reconcile_cmd}" ]]; then
+    reconcile_cmd="${SCRIPT_DIR}/scripts/network-reconcile.sh"
+  fi
+
+  [[ -x "${reconcile_cmd}" ]] || err "Joined-node repair could not find a runnable network-reconcile script."
+
+  step "Running joined-node repair reconcile"
+  "${reconcile_cmd}"
+
+  print_join_summary
+}
+
+install_repair() {
+  local existing_server existing_token
+  existing_server="$(read_rke2_config_value server || true)"
+
+  if [[ -n "${existing_server}" ]]; then
+    CLUSTER_SERVER="${existing_server}"
+    existing_token="$(read_rke2_config_value token || true)"
+    [[ -n "${existing_token}" ]] || err "Existing join config is missing token: ${RKE2_CONFIG_DIR}/config.yaml"
+    CLUSTER_TOKEN="${existing_token}"
+    CLUSTER_ROLE="$(detect_local_join_role)"
+    repair_joined_node
+  else
+    install_init "repair"
+  fi
+}
+
+install_auto_join() {
+  local discovery_mode="$1"
+  local discovered_mode=""
+
+  load_autojoin_from_discovery
+  discovered_mode="${AUTOJOIN_DISCOVERY_MODE:-}"
+
+  case "${discovery_mode}" in
+    open)
+      [[ "${discovered_mode}" == "open" ]] || \
+        err "Expected open discovery mode but found ${discovered_mode}."
+      info "Auto-join candidate detected via discovery at ${CLUSTER_SERVER}."
+      info "Using discovered join token from LAN advertisement."
+      install_join
+      ;;
+    manual)
+      [[ "${discovered_mode}" == "manual" ]] || \
+        err "Expected manual discovery mode but found ${discovered_mode}."
+      warn "Discovered an existing cluster at ${CLUSTER_SERVER}, but it is advertising manual join mode and withholds the join token."
+      err "Manual join credentials are required. Re-run with CLUSTER_SERVER=\"${CLUSTER_SERVER}\" and CLUSTER_TOKEN=\"<token>\"."
+      ;;
+    *)
+      err "Unsupported auto-join discovery mode: ${discovery_mode}"
+      ;;
+  esac
 }
 
 # ── Summary output ─────────────────────────────────────────────────────────────
@@ -1129,6 +1699,8 @@ check_firmware() {
 
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
 main() {
+  local install_mode
+
   require_root
 
   echo
@@ -1142,13 +1714,33 @@ main() {
   prepare_system          # swap, kernel modules, sysctl, NetworkManager, UFW
   install_prereqs         # helm
 
-  if [[ -z "$CLUSTER_SERVER" ]]; then
-    echo -e "  ${BOLD}Mode: INIT${NC} — bootstrapping a new cluster"
-    install_init
-  else
-    echo -e "  ${BOLD}Mode: JOIN${NC} — joining existing cluster at ${CLUSTER_SERVER}"
-    install_join
-  fi
+  install_mode="$(select_install_mode)"
+
+  case "${install_mode}" in
+    manual-join)
+      echo -e "  ${BOLD}Mode: MANUAL-JOIN${NC} — joining existing cluster at ${CLUSTER_SERVER}"
+      install_join
+      ;;
+    repair)
+      echo -e "  ${BOLD}Mode: REPAIR${NC} — reconciling existing local RKE2 install"
+      install_repair
+      ;;
+    auto-join-open)
+      echo -e "  ${BOLD}Mode: AUTO-JOIN${NC} — joining the discovered cluster via open LAN metadata"
+      install_auto_join "open"
+      ;;
+    auto-join-manual)
+      echo -e "  ${BOLD}Mode: DISCOVERED-MANUAL${NC} — cluster found, but manual join credentials are still required"
+      install_auto_join "manual"
+      ;;
+    init)
+      echo -e "  ${BOLD}Mode: INIT${NC} — bootstrapping a new cluster"
+      install_init "bootstrap"
+      ;;
+    *)
+      err "Unsupported install mode: ${install_mode}"
+      ;;
+  esac
 }
 
 main "$@"

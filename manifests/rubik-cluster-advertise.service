@@ -1,0 +1,17 @@
+[Unit]
+Description=Rubik Pi cluster advertisement publisher
+Documentation=https://github.com/rubik-kuber
+After=network-online.target avahi-daemon.service
+Wants=network-online.target avahi-daemon.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/default/rubik-cluster-advertise
+ExecStart=/usr/bin/env bash -lc 'test -x /usr/local/bin/rubik-cluster-discovery && exec /usr/local/bin/rubik-cluster-discovery advertise-service'
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rubik-cluster-advertise
+
+[Install]
+WantedBy=multi-user.target
