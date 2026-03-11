@@ -569,6 +569,11 @@ SOURCES
   apt-get install -y -qq linux-firmware || \
     warn "linux-firmware upgrade failed — QNN/SNPE packages may not install"
 
+  # Keep the board on the current qcom kernel line. We found rubik2 only gained
+  # stable normal-user GPU OpenCL after moving from 1054 to the 1064 kernel.
+  apt-get install -y -qq linux-image-qcom linux-firmware-qcom-rubikpi3 || \
+    warn "qcom kernel / board firmware upgrade failed — full GPU parity may require manual repair"
+
   # ── Qualcomm AI inference SDKs ─────────────────────────────────────────────
   # QNN and SNPE packages are installed one-by-one so that a single broken
   # or unavailable package doesn't block the rest of the stack.
@@ -583,7 +588,10 @@ SOURCES
   # ── Adreno GPU OpenCL ICD ──────────────────────────────────────────────────
   # Provides libOpenCL_adreno.so, libadreno_utils.so, and the adreno.icd
   # entry that the OCL ICD loader uses to enumerate the Adreno GPU platform.
-  apt-get install -y -qq qcom-adreno1 || true
+  # Older installer revisions could leave the generic ocl-icd loader installed.
+  # That owned libOpenCL.so.1 and caused rubik2 to enumerate CPU-only OpenCL.
+  apt-get remove -y -qq ocl-icd-opencl-dev ocl-icd-libopencl1 clinfo 2>/dev/null || true
+  apt-get install -y -qq --reinstall qcom-adreno1 clinfo || true
 
   # ── FastRPC userspace libraries ────────────────────────────────────────────
   # libcdsprpc.so / libadsprpc.so — needed to open RPC sessions to CDSP
@@ -606,10 +614,10 @@ SOURCES
   # ── CPU OpenCL via POCL ────────────────────────────────────────────────────
   # POCL provides a full OpenCL 3.0 implementation on the ARM CPU, useful for
   # testing OpenCL kernels without a GPU driver.
-  # ocl-icd-opencl-dev / opencl-headers — needed to compile OpenCL programs.
+  # Install headers only; avoid the generic ICD runtime that displaced Adreno.
   apt-get install -y -qq \
     pocl-opencl-icd \
-    ocl-icd-opencl-dev \
+    opencl-c-headers \
     opencl-headers \
     opencl-clhpp-headers \
     clinfo || true
@@ -647,6 +655,19 @@ SOURCES
     log "Created linker symlink: ${ocl_lib} → libOpenCL.so.1"
   fi
 
+  # qcom-adreno1 does not reliably materialize the ICD file on every image, so
+  # write it explicitly. Without this, clinfo and QNN can fall back to CPU-only.
+  mkdir -p /etc/OpenCL/vendors
+  printf '%s\n' "libOpenCL_adreno.so.1" > /etc/OpenCL/vendors/adreno.icd
+  log "Ensured Adreno OpenCL ICD: /etc/OpenCL/vendors/adreno.icd"
+
+  local boot_kernel=""
+  boot_kernel=$(basename "$(readlink -f /boot/vmlinuz 2>/dev/null || true)" 2>/dev/null || true)
+  boot_kernel="${boot_kernel#vmlinuz-}"
+  if [[ -n "${boot_kernel}" && "${boot_kernel}" != "$(uname -r)" ]]; then
+    warn "New qcom kernel installed (${boot_kernel}); reboot after install for full GPU/OpenCL parity"
+  fi
+
   log "Qualcomm hardware SDK stack installed"
 }
 
@@ -676,6 +697,15 @@ prepare_system() {
 
   if declare -F ensure_local_mdns_resolution >/dev/null 2>&1; then
     ensure_local_mdns_resolution || warn "Could not update nsswitch.conf for .local name resolution"
+  fi
+
+  # Normal-user GPU OpenCL requires access to /dev/dri/renderD128. Fresh images
+  # do not always place the invoking user into the render group.
+  if getent group render >/dev/null 2>&1; then
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+      usermod -aG render "${SUDO_USER}" 2>/dev/null || warn "Could not add ${SUDO_USER} to render group"
+      log "Ensured ${SUDO_USER} belongs to the render group"
+    fi
   fi
 
   # ── Swap ──
