@@ -23,6 +23,7 @@
 #   METALLB_RANGE            — IP range for MetalLB (init node only)
 #   AUTOJOIN_ADVERTISE_TOKEN — init-node discovery policy override ("yes" or "no")
 #   RANCHER_PASSWORD         — Rancher bootstrap password (default: rubikpi-admin)
+#   INSTALL_VERBOSE          — "1" = stream full command output during install
 
 set -euo pipefail
 
@@ -36,6 +37,94 @@ warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 err()  { echo -e "${RED}[✗]${NC} $*" >&2; exit 1; }
 step() { echo -e "\n${BOLD}${BLUE}── $* ──${NC}"; }
 
+run_with_progress() {
+  local description="$1"
+  local heartbeat="$2"
+  shift 2
+
+  if [[ "${INSTALL_VERBOSE}" == "1" ]]; then
+    info "${description}"
+    "$@"
+    return
+  fi
+
+  local log_file pid status start elapsed spinner='-\|/' idx=0
+  log_file="$(mktemp /tmp/rubik-install.XXXXXX)"
+  "$@" >"${log_file}" 2>&1 &
+  pid=$!
+  start=$(date +%s)
+
+  while kill -0 "${pid}" 2>/dev/null; do
+    elapsed=$(( $(date +%s) - start ))
+    printf "\r${BLUE}[→]${NC} %s (%ss) %s" "${heartbeat}" "${elapsed}" "${spinner:${idx}:1}"
+    idx=$(( (idx + 1) % 4 ))
+    sleep 2
+  done
+
+  wait "${pid}"
+  status=$?
+  printf "\r\033[K"
+
+  if [[ "${status}" -ne 0 ]]; then
+    warn "${description} failed — showing captured output"
+    sed 's/^/    /' "${log_file}" >&2 || true
+    rm -f "${log_file}"
+    return "${status}"
+  fi
+
+  rm -f "${log_file}"
+  log "${description} complete"
+}
+
+run_shell_with_progress() {
+  local description="$1"
+  local heartbeat="$2"
+  local command="$3"
+
+  if [[ "${INSTALL_VERBOSE}" == "1" ]]; then
+    info "${description}"
+    bash -lc "set -euo pipefail; ${command}"
+    return
+  fi
+
+  local log_file pid status start elapsed spinner='-\|/' idx=0
+  log_file="$(mktemp /tmp/rubik-install.XXXXXX)"
+  bash -lc "set -euo pipefail; ${command}" >"${log_file}" 2>&1 &
+  pid=$!
+  start=$(date +%s)
+
+  while kill -0 "${pid}" 2>/dev/null; do
+    elapsed=$(( $(date +%s) - start ))
+    printf "\r${BLUE}[→]${NC} %s (%ss) %s" "${heartbeat}" "${elapsed}" "${spinner:${idx}:1}"
+    idx=$(( (idx + 1) % 4 ))
+    sleep 2
+  done
+
+  wait "${pid}"
+  status=$?
+  printf "\r\033[K"
+
+  if [[ "${status}" -ne 0 ]]; then
+    warn "${description} failed — showing captured output"
+    sed 's/^/    /' "${log_file}" >&2 || true
+    rm -f "${log_file}"
+    return "${status}"
+  fi
+
+  rm -f "${log_file}"
+  log "${description} complete"
+}
+
+wait_status() {
+  local attempt="$1"
+  local max="$2"
+  local message="$3"
+
+  if [[ "${INSTALL_VERBOSE}" == "1" || "${attempt}" -eq 1 || $(( attempt % 3 )) -eq 0 ]]; then
+    info "${message} (attempt ${attempt}/${max})"
+  fi
+}
+
 # ── Configuration ──────────────────────────────────────────────────────────────
 CLUSTER_SERVER="${CLUSTER_SERVER:-}"
 CLUSTER_TOKEN="${CLUSTER_TOKEN:-}"
@@ -43,6 +132,14 @@ CLUSTER_ROLE="${CLUSTER_ROLE:-}"
 METALLB_RANGE="${METALLB_RANGE:-}"
 AUTOJOIN_ADVERTISE_TOKEN="${AUTOJOIN_ADVERTISE_TOKEN:-}"
 RANCHER_PASSWORD="${RANCHER_PASSWORD:-rubikpi-admin}"
+INSTALL_VERBOSE="${INSTALL_VERBOSE:-0}"
+
+APT_INSTALL_FLAGS=(-y -qq)
+APT_UPDATE_FLAGS=(-qq)
+if [[ "${INSTALL_VERBOSE}" == "1" ]]; then
+  APT_INSTALL_FLAGS=(-y)
+  APT_UPDATE_FLAGS=()
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RKE2_CONFIG_DIR="/etc/rancher/rke2"
@@ -63,6 +160,22 @@ if [[ -f "${CLUSTER_DISCOVERY_HELPERS}" ]]; then
 fi
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+apt_update_cmd() {
+  apt-get update "${APT_UPDATE_FLAGS[@]}"
+}
+
+apt_install_cmd() {
+  apt-get install "${APT_INSTALL_FLAGS[@]}" "$@"
+}
+
+apt_remove_cmd() {
+  apt-get remove "${APT_INSTALL_FLAGS[@]}" "$@"
+}
+
+apt_fix_cmd() {
+  apt-get -f install "${APT_INSTALL_FLAGS[@]}"
+}
+
 require_root() {
   [[ $EUID -eq 0 ]] || err "Run this script as root: sudo ./install.sh"
 }
@@ -581,8 +694,10 @@ SOURCES
 
   # ── Repair any interrupted installs or held broken packages ───────────────
   # This is common on a fresh Rubik Pi image that had a partial update.
-  dpkg --configure -a 2>/dev/null || true
-  apt-get -f install -y -qq 2>/dev/null || true
+  run_with_progress "Repairing interrupted package state" "Repairing interrupted packages" \
+    dpkg --configure -a || true
+  run_with_progress "Repairing broken package dependencies" "Repairing package dependencies" \
+    apt_fix_cmd || true
 
   # Remove any legacy apt pins or holds from previous installer versions that
   # may have been written to prevent linux-firmware from upgrading.  The correct
@@ -593,7 +708,8 @@ SOURCES
   rm -f /etc/apt/preferences.d/rubikpi-firmware
   apt-mark unhold linux-firmware 2>/dev/null || true
 
-  apt-get update -qq
+  run_with_progress "Refreshing apt package indexes" "Refreshing package indexes" \
+    apt_update_cmd
 
   # ── Linux firmware ─────────────────────────────────────────────────────────
   # linux-firmware-dragonwing (pre-installed on Rubik Pi) declares:
@@ -602,12 +718,14 @@ SOURCES
   # (0ubuntu2.14) that doesn't satisfy this.  Upgrade it explicitly so the
   # dragonwing dependency is satisfied before we try to install any Qualcomm
   # SDK packages that transitively depend on this being resolved.
-  apt-get install -y -qq linux-firmware || \
+  run_with_progress "Installing linux-firmware" "Installing linux-firmware" \
+    apt_install_cmd linux-firmware || \
     warn "linux-firmware upgrade failed — QNN/SNPE packages may not install"
 
   # Keep the board on the current qcom kernel line. We found rubik2 only gained
   # stable normal-user GPU OpenCL after moving from 1054 to the 1064 kernel.
-  apt-get install -y -qq linux-image-qcom linux-firmware-qcom-rubikpi3 || \
+  run_with_progress "Installing qcom kernel and board firmware" "Installing qcom kernel and board firmware" \
+    apt_install_cmd linux-image-qcom linux-firmware-qcom-rubikpi3 || \
     warn "qcom kernel / board firmware upgrade failed — full GPU parity may require manual repair"
 
   # ── Qualcomm AI inference SDKs ─────────────────────────────────────────────
@@ -618,7 +736,8 @@ SOURCES
   local qnn_pkgs=(libqnn1 libqnn-dev qnn-tools)
   local snpe_pkgs=(libsnpe1 libsnpe-dev snpe-tools)
   for pkg in "${qnn_pkgs[@]}" "${snpe_pkgs[@]}"; do
-    apt-get install -y -qq "$pkg" 2>/dev/null || warn "Could not install ${pkg} — skipping"
+    run_with_progress "Installing ${pkg}" "Installing ${pkg}" \
+      apt_install_cmd "$pkg" || warn "Could not install ${pkg} — skipping"
   done
 
   # ── Adreno GPU OpenCL ICD ──────────────────────────────────────────────────
@@ -626,8 +745,10 @@ SOURCES
   # entry that the OCL ICD loader uses to enumerate the Adreno GPU platform.
   # Older installer revisions could leave the generic ocl-icd loader installed.
   # That owned libOpenCL.so.1 and caused rubik2 to enumerate CPU-only OpenCL.
-  apt-get remove -y -qq ocl-icd-opencl-dev ocl-icd-libopencl1 clinfo 2>/dev/null || true
-  apt-get install -y -qq --reinstall qcom-adreno1 clinfo || true
+  run_with_progress "Removing conflicting generic OpenCL runtime" "Removing conflicting OpenCL runtime" \
+    apt_remove_cmd ocl-icd-opencl-dev ocl-icd-libopencl1 clinfo || true
+  run_with_progress "Reinstalling Adreno OpenCL userspace" "Reinstalling Adreno OpenCL userspace" \
+    apt_install_cmd --reinstall qcom-adreno1 clinfo || true
 
   # ── FastRPC userspace libraries ────────────────────────────────────────────
   # libcdsprpc.so / libadsprpc.so — needed to open RPC sessions to CDSP
@@ -636,7 +757,8 @@ SOURCES
   # qcom-property-vault — provides libpropertyvault.so which the Adreno OCL
   # ICD uses for Android-style system properties on Linux.
   for pkg in qcom-fastrpc1 qcom-fastrpc-dev qcom-property-vault; do
-    apt-get install -y -qq "$pkg" 2>/dev/null || warn "Could not install ${pkg} — skipping"
+    run_with_progress "Installing ${pkg}" "Installing ${pkg}" \
+      apt_install_cmd "$pkg" || warn "Could not install ${pkg} — skipping"
   done
 
   # ── Ensure FastRPC daemons are enabled and running ─────────────────────────
@@ -651,12 +773,13 @@ SOURCES
   # POCL provides a full OpenCL 3.0 implementation on the ARM CPU, useful for
   # testing OpenCL kernels without a GPU driver.
   # Install headers only; avoid the generic ICD runtime that displaced Adreno.
-  apt-get install -y -qq \
-    pocl-opencl-icd \
-    opencl-c-headers \
-    opencl-headers \
-    opencl-clhpp-headers \
-    clinfo || true
+  run_with_progress "Installing CPU OpenCL tooling" "Installing CPU OpenCL tooling" \
+    apt_install_cmd \
+      pocl-opencl-icd \
+      opencl-c-headers \
+      opencl-headers \
+      opencl-clhpp-headers \
+      clinfo || true
 
   # ── V4L2 / GStreamer tools ─────────────────────────────────────────────────
   # v4l-utils — v4l2-ctl, v4l2-compliance: inspect and test video devices
@@ -665,19 +788,21 @@ SOURCES
   #   v4l2h264enc element used to drive the VPU from scripts/containers.
   # The Qualcomm GStreamer plugins (gstreamer1.0-plugins-qcom-*) are already
   # pre-installed by the Thundercomm/Tangshan repos in the base image.
-  apt-get install -y -qq \
-    v4l-utils \
-    gstreamer1.0-tools \
-    gstreamer1.0-plugins-bad || true
+  run_with_progress "Installing V4L2 and GStreamer tooling" "Installing V4L2 and GStreamer tooling" \
+    apt_install_cmd \
+      v4l-utils \
+      gstreamer1.0-tools \
+      gstreamer1.0-plugins-bad || true
 
   # ── C++ build toolchain ────────────────────────────────────────────────────
   # Required to compile the hw_bench C++ benchmark on the node itself.
   # cmake ≥ 3.16, g++13, libdrm-dev for DRM/KMS device queries.
-  apt-get install -y -qq \
-    cmake \
-    build-essential \
-    g++ \
-    libdrm-dev || true
+  run_with_progress "Installing C++ build tooling" "Installing C++ build tooling" \
+    apt_install_cmd \
+      cmake \
+      build-essential \
+      g++ \
+      libdrm-dev || true
 
   # ── libOpenCL.so linker symlink ─────────────────────────────────────────────
   # qcom-adreno1 ships libOpenCL.so.1 (the runtime) but NOT the bare linker
@@ -712,13 +837,15 @@ prepare_system() {
   step "Preparing system"
 
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
+  run_with_progress "Refreshing apt package indexes" "Refreshing package indexes" \
+    apt_update_cmd
   # open-iscsi + iscsid: required by Longhorn for block storage
   # nfs-common: required by Longhorn for backup NFS targets
   # util-linux: provides findmnt/blkid used by Longhorn
   # avahi-daemon + avahi-utils + libnss-mdns: advertise, browse, and resolve .local
   # discovery endpoints on fresh images without requiring manual NSS edits.
-  apt-get install -y -qq curl openssl open-iscsi nfs-common util-linux avahi-daemon avahi-utils libnss-mdns
+  run_with_progress "Installing base system packages" "Installing base system packages" \
+    apt_install_cmd curl openssl open-iscsi nfs-common util-linux avahi-daemon avahi-utils libnss-mdns
 
   # Enable iscsid — Longhorn requires it to be running on every node
   systemctl enable iscsid 2>/dev/null || true
@@ -811,9 +938,8 @@ install_prereqs() {
   step "Installing prerequisites"
 
   if ! command -v helm &>/dev/null; then
-    info "Installing Helm..."
-    curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash -s -- --no-sudo 2>/dev/null || \
-      curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+    run_shell_with_progress "Installing Helm" "Installing Helm" \
+      "curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash -s -- --no-sudo 2>/dev/null || curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash"
   else
     log "Helm $(helm version --short 2>/dev/null | grep -oP 'v[0-9.]+' | head -1) already installed"
   fi
@@ -883,10 +1009,9 @@ wait_for_node_ready() {
       log "Node '${node}' is Ready"
       return 0
     fi
-    echo -n "."
+    wait_status "$i" "$max" "Still waiting for node '${node}' to report Ready"
     sleep 5
   done
-  echo
   err "Timed out waiting for node '${node}' — check: journalctl -u rke2-server -f"
 }
 
@@ -905,10 +1030,11 @@ wait_for_lb_ip() {
       echo "$ip"
       return 0
     fi
-    echo -n "." >&2
+    if [[ "${INSTALL_VERBOSE}" == "1" || "${i}" -eq 1 || $(( i % 3 )) -eq 0 ]]; then
+      info "Still waiting for LoadBalancer IP on ${ns}/${svc} (attempt ${i}/${max})" >&2
+    fi
     sleep 5
   done
-  echo >&2
   return 1
 }
 
@@ -926,10 +1052,9 @@ wait_for_pods() {
       log "All pods ready in ${ns}"
       return 0
     fi
-    echo -n "."
+    wait_status "$i" "$max" "Still waiting for pods in ${ns} matching ${selector} (${running}/${total} running)"
     sleep 5
   done
-  echo
   warn "Pods in ${ns} (${selector}) not all ready after timeout — continuing"
 }
 
@@ -942,11 +1067,12 @@ install_rke2() {
     return 0
   fi
 
-  info "Downloading and installing RKE2 (${rke2_type})..."
-  curl -sfL https://get.rke2.io | INSTALL_RKE2_TYPE="$rke2_type" sh -
+  run_shell_with_progress "Downloading and installing RKE2 (${rke2_type})" "Installing RKE2 (${rke2_type})" \
+    "curl -sfL https://get.rke2.io | INSTALL_RKE2_TYPE='${rke2_type}' sh -"
 
   systemctl enable "rke2-${rke2_type}"
-  systemctl start  "rke2-${rke2_type}"
+  run_with_progress "Starting rke2-${rke2_type}" "Starting rke2-${rke2_type}" \
+    systemctl start "rke2-${rke2_type}"
 
   log "rke2-${rke2_type} started"
 }
@@ -958,13 +1084,16 @@ install_metallb() {
   local range="$1"
   step "Installing MetalLB"
 
-  helm repo add metallb https://metallb.github.io/metallb --force-update 2>/dev/null
-  helm repo update metallb 2>/dev/null
-  helm upgrade --install metallb metallb/metallb \
-    --namespace metallb-system \
-    --create-namespace \
-    --wait \
-    --timeout 5m
+  run_with_progress "Adding MetalLB Helm repo" "Adding MetalLB Helm repo" \
+    helm repo add metallb https://metallb.github.io/metallb --force-update
+  run_with_progress "Updating MetalLB Helm repo" "Updating MetalLB Helm repo" \
+    helm repo update metallb
+  run_with_progress "Installing MetalLB chart" "Installing MetalLB chart" \
+    helm upgrade --install metallb metallb/metallb \
+      --namespace metallb-system \
+      --create-namespace \
+      --wait \
+      --timeout 5m
 
   info "Configuring MetalLB IP pool: ${range}"
   "$RKE2_KUBECTL" apply -f - <<EOF
@@ -1020,20 +1149,23 @@ print(json.dumps(svc))
 install_traefik() {
   step "Installing Traefik"
 
-  helm repo add traefik https://traefik.github.io/charts --force-update 2>/dev/null
-  helm repo update traefik 2>/dev/null
+  run_with_progress "Adding Traefik Helm repo" "Adding Traefik Helm repo" \
+    helm repo add traefik https://traefik.github.io/charts --force-update
+  run_with_progress "Updating Traefik Helm repo" "Updating Traefik Helm repo" \
+    helm repo update traefik
 
-  helm upgrade --install traefik traefik/traefik \
-    --namespace traefik \
-    --create-namespace \
-    --wait \
-    --timeout 5m \
-    --set "deployment.replicas=1" \
-    --set "service.type=LoadBalancer" \
-    --set "ingressClass.enabled=true" \
-    --set "ingressClass.isDefaultClass=true" \
-    --set "providers.kubernetesIngress.publishedService.enabled=true" \
-    --set "logs.general.level=INFO"
+  run_with_progress "Installing Traefik chart" "Installing Traefik chart" \
+    helm upgrade --install traefik traefik/traefik \
+      --namespace traefik \
+      --create-namespace \
+      --wait \
+      --timeout 5m \
+      --set "deployment.replicas=1" \
+      --set "service.type=LoadBalancer" \
+      --set "ingressClass.enabled=true" \
+      --set "ingressClass.isDefaultClass=true" \
+      --set "providers.kubernetesIngress.publishedService.enabled=true" \
+      --set "logs.general.level=INFO"
 
   log "Traefik installed"
 }
@@ -1041,15 +1173,18 @@ install_traefik() {
 install_cert_manager() {
   step "Installing cert-manager"
 
-  helm repo add jetstack https://charts.jetstack.io --force-update 2>/dev/null
-  helm repo update jetstack 2>/dev/null
+  run_with_progress "Adding cert-manager Helm repo" "Adding cert-manager Helm repo" \
+    helm repo add jetstack https://charts.jetstack.io --force-update
+  run_with_progress "Updating cert-manager Helm repo" "Updating cert-manager Helm repo" \
+    helm repo update jetstack
 
-  helm upgrade --install cert-manager jetstack/cert-manager \
-    --namespace cert-manager \
-    --create-namespace \
-    --set crds.enabled=true \
-    --wait \
-    --timeout 5m
+  run_with_progress "Installing cert-manager chart" "Installing cert-manager chart" \
+    helm upgrade --install cert-manager jetstack/cert-manager \
+      --namespace cert-manager \
+      --create-namespace \
+      --set crds.enabled=true \
+      --wait \
+      --timeout 5m
 
   log "cert-manager installed"
 }
@@ -1073,20 +1208,23 @@ install_rancher() {
 
   log "Rancher hostname: ${rancher_hostname}"
 
-  helm repo add rancher-stable https://releases.rancher.com/server-charts/stable --force-update 2>/dev/null
-  helm repo update rancher-stable 2>/dev/null
+  run_with_progress "Adding Rancher Helm repo" "Adding Rancher Helm repo" \
+    helm repo add rancher-stable https://releases.rancher.com/server-charts/stable --force-update
+  run_with_progress "Updating Rancher Helm repo" "Updating Rancher Helm repo" \
+    helm repo update rancher-stable
 
-  helm upgrade --install rancher rancher-stable/rancher \
-    --namespace cattle-system \
-    --create-namespace \
-    --set "hostname=${rancher_hostname}" \
-    --set "bootstrapPassword=${RANCHER_PASSWORD}" \
-    --set "replicas=1" \
-    --set "ingress.tls.source=rancher" \
-    --set "ingress.ingressClassName=traefik" \
-    --set "global.cattle.psp.enabled=false" \
-    --wait \
-    --timeout 10m
+  run_with_progress "Installing Rancher chart" "Installing Rancher chart" \
+    helm upgrade --install rancher rancher-stable/rancher \
+      --namespace cattle-system \
+      --create-namespace \
+      --set "hostname=${rancher_hostname}" \
+      --set "bootstrapPassword=${RANCHER_PASSWORD}" \
+      --set "replicas=1" \
+      --set "ingress.tls.source=rancher" \
+      --set "ingress.ingressClassName=traefik" \
+      --set "global.cattle.psp.enabled=false" \
+      --wait \
+      --timeout 10m
 
   log "Rancher installed at https://${rancher_hostname}"
 }
@@ -1094,20 +1232,23 @@ install_rancher() {
 install_longhorn() {
   step "Installing Longhorn (distributed block storage)"
 
-  helm repo add longhorn https://charts.longhorn.io --force-update 2>/dev/null
-  helm repo update longhorn 2>/dev/null
+  run_with_progress "Adding Longhorn Helm repo" "Adding Longhorn Helm repo" \
+    helm repo add longhorn https://charts.longhorn.io --force-update
+  run_with_progress "Updating Longhorn Helm repo" "Updating Longhorn Helm repo" \
+    helm repo update longhorn
 
   # defaultReplicaCount=1: required for single-node — Longhorn won't schedule
   # volumes with replica count > number of nodes.
-  helm upgrade --install longhorn longhorn/longhorn \
-    --namespace longhorn-system \
-    --create-namespace \
-    --wait \
-    --timeout 10m \
-    --set "persistence.defaultClass=true" \
-    --set "persistence.defaultClassReplicaCount=1" \
-    --set "defaultSettings.defaultReplicaCount=1" \
-    --set "defaultSettings.storageMinimalAvailablePercentage=10"
+  run_with_progress "Installing Longhorn chart" "Installing Longhorn chart" \
+    helm upgrade --install longhorn longhorn/longhorn \
+      --namespace longhorn-system \
+      --create-namespace \
+      --wait \
+      --timeout 10m \
+      --set "persistence.defaultClass=true" \
+      --set "persistence.defaultClassReplicaCount=1" \
+      --set "defaultSettings.defaultReplicaCount=1" \
+      --set "defaultSettings.storageMinimalAvailablePercentage=10"
 
   log "Longhorn installed — default StorageClass: longhorn"
 }
@@ -1377,6 +1518,7 @@ fix_ip_change() {
     info "Waiting for cluster-reset to complete (up to 120 s)..."
     local i
     for i in $(seq 1 24); do
+      wait_status "$i" 24 "Still waiting for cluster-reset to finish"
       sleep 5
       if ! kill -0 "$reset_pid" 2>/dev/null; then
         break
@@ -1598,10 +1740,13 @@ EOF
         fi
       fi
     fi
-    echo -n "."
+    if [[ "$rke2_type" == "server" ]]; then
+      wait_status "$i" 60 "Still waiting for local RKE2 server health endpoint"
+    else
+      wait_status "$i" 60 "Still waiting for local RKE2 agent health endpoint"
+    fi
     sleep 5
   done
-  echo
 
   # Server nodes (additional control-plane members) carry the same
   # node-role.kubernetes.io/control-plane:NoSchedule taint as the init node.

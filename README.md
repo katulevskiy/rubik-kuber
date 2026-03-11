@@ -172,6 +172,7 @@ discovery.
 | `METALLB_RANGE` | *(auto-derived when unset)* | Free IP range on your LAN |
 | `AUTOJOIN_ADVERTISE_TOKEN` | *(prompted on first init bootstrap)* | `yes` = advertise raw token (`open`), `no` = advertise manual-only discovery |
 | `RANCHER_PASSWORD` | `rubikpi-admin` | Rancher bootstrap password |
+| `INSTALL_VERBOSE` | `0` | `1` = stream full underlying installer command output instead of the default clean progress UI |
 
 ---
 
@@ -210,6 +211,8 @@ Use this checklist when validating the auto-install / auto-rejoin flow:
 | Fresh later node, manual fallback | `sudo CLUSTER_SERVER="https://<init-node-short-hostname>.local:9345" CLUSTER_TOKEN="<token>" ./install.sh` | Joins with explicit credentials even if discovery is unavailable or manual-only |
 | Existing node after network/IP change | `sudo ./install.sh` | Enters repair/reconcile mode and refreshes local config instead of bootstrapping a new cluster |
 | Control-plane IP change | `sudo ./install.sh` on the init node, then `sudo ./install.sh` on later nodes if needed | `<current-short-hostname>.local` discovery and cluster access recover without replacing the cluster |
+
+By default the installer shows concise step messages plus progress heartbeats for long-running operations. Use `INSTALL_VERBOSE=1 sudo ./install.sh` when you want the raw `apt`, `helm`, and `rke2` command output.
 
 ---
 

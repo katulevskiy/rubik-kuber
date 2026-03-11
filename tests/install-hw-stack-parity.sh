@@ -28,7 +28,7 @@ install_source="$(<"${INSTALL_SH}")"
 assert_not_contains $'    ocl-icd-opencl-dev \\' "${install_source}" \
   "installer should avoid installing the generic OpenCL ICD dev package that broke Adreno on rubik2"
 
-assert_contains "apt-get remove -y -qq ocl-icd-opencl-dev ocl-icd-libopencl1 clinfo" "${install_source}" \
+assert_contains "apt_remove_cmd ocl-icd-opencl-dev ocl-icd-libopencl1 clinfo" "${install_source}" \
   "installer should remove the stale generic OpenCL ICD packages during repair"
 
 assert_contains "linux-image-qcom" "${install_source}" \

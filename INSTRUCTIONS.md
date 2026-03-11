@@ -118,6 +118,8 @@ Use this checklist when validating the install flows:
 | Existing node after DHCP or subnet changes | `sudo ./install.sh` | Repairs local config and re-runs reconcile logic instead of re-bootstrapping |
 | Control-plane address drift | verify `<current-short-hostname>.local` resolves to the init node, then re-run `sudo ./install.sh` as needed | Discovery and cluster access recover without rebuilding the cluster |
 
+By default the installer keeps output clean and emits heartbeat progress messages for long `apt`, `helm`, and `rke2` steps. Use `INSTALL_VERBOSE=1 sudo ./install.sh` if you want the full raw command output instead.
+
 ```bash
 # Verify cluster is up
 kubectl get nodes
