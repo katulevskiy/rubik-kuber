@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rubik-cpu-topology-labeler
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: rubik-cpu-topology-labeler
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: rubik-cpu-topology-labeler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: rubik-cpu-topology-labeler
+subjects:
+  - kind: ServiceAccount
+    name: rubik-cpu-topology-labeler
+    namespace: kube-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rubik-cpu-topology-labeler
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: rubik-cpu-topology-labeler
+  template:
+    metadata:
+      labels:
+        app: rubik-cpu-topology-labeler
+    spec:
+      serviceAccountName: rubik-cpu-topology-labeler
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: labeler
+          image: alpine:3.21
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              while true; do
+                /host-rke2-bin/kubectl label node "${NODE_NAME}" \
+                  rubikpi.ai/cpu-silver-cores="0-3" \
+                  rubikpi.ai/cpu-gold-cores="4-6" \
+                  rubikpi.ai/cpu-gold-plus-cores="7" \
+                  --overwrite >/dev/null 2>&1 || true
+                sleep 300
+              done
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: host-rke2-bin
+              mountPath: /host-rke2-bin
+              readOnly: true
+      volumes:
+        - name: host-rke2-bin
+          hostPath:
+            path: /var/lib/rancher/rke2/bin
+            type: Directory

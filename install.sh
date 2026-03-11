@@ -1354,6 +1354,18 @@ install_device_plugin() {
   fi
 }
 
+install_cpu_topology_labeler() {
+  step "Installing CPU topology labeler"
+
+  local manifest="${SCRIPT_DIR}/manifests/cpu-topology-labeler.yaml"
+  if [[ -f "$manifest" ]]; then
+    "$RKE2_KUBECTL" apply -f "$manifest"
+    log "CPU topology labeler applied (DaemonSet will label all Rubik nodes automatically)"
+  else
+    warn "manifests/cpu-topology-labeler.yaml not found — skipping"
+  fi
+}
+
 label_node_cpu_topology() {
   # Label this node with its CPU core type assignments so session.sh and other
   # tools can discover which cpuset corresponds to each Kryo 670 cluster.
@@ -1750,6 +1762,7 @@ EOF
   install_longhorn
   install_rancher "$node_ip"
   install_device_plugin
+  install_cpu_topology_labeler
   apply_session_rbac
   patch_coredns_for_session_taint
   label_node_cpu_topology
