@@ -591,6 +591,7 @@ EOF
 load_discovery_target() {
   local record=""
   local server_host=""
+  local server_address=""
   local server_port=""
   local mode=""
   local token=""
@@ -603,6 +604,7 @@ load_discovery_target() {
 
   server_host=$(extract_discovery_record_field "${record}" "server_host" || true)
   server_port=$(extract_discovery_record_field "${record}" "server_port" || true)
+  server_address=$(printf '%s\n' "${record}" | awk -F';' '$1 == "=" { print $8; exit }')
   mode=$(extract_discovery_record_field "${record}" "mode" || true)
   token=$(extract_discovery_record_field "${record}" "token" || true)
 
@@ -621,7 +623,11 @@ load_discovery_target() {
   esac
 
   printf '%s\n' "${mode}"
-  printf 'https://%s:%s\n' "${server_host}" "${server_port}"
+  if [[ -n "${server_address}" ]]; then
+    printf 'https://%s:%s\n' "${server_address}" "${server_port}"
+  else
+    printf 'https://%s:%s\n' "${server_host}" "${server_port}"
+  fi
   printf '%s\n' "${token}"
 }
 

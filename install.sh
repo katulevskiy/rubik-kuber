@@ -164,6 +164,22 @@ parse_discovery_record_field() {
   '
 }
 
+parse_discovery_record_address() {
+  local record="$1"
+  printf '%s\n' "${record}" | awk -F';' '$1 == "=" { print $8; exit }'
+}
+
+parse_discovery_record_service_port() {
+  local record="$1"
+  local field_port=""
+  field_port="$(printf '%s\n' "${record}" | awk -F';' '$1 == "=" { print $9; exit }')"
+  if [[ -n "${field_port}" ]]; then
+    printf '%s\n' "${field_port}"
+  else
+    parse_discovery_record_field "${record}" "server_port"
+  fi
+}
+
 inspect_discovery_candidate() {
   declare -F discover_cluster_records >/dev/null 2>&1 || {
     printf '%s\n' "unavailable"
@@ -267,6 +283,7 @@ load_autojoin_from_discovery() {
   local discovery_state=""
   local record=""
   local server_host=""
+  local server_address=""
   local server_port=""
   local token=""
 
@@ -298,11 +315,16 @@ load_autojoin_from_discovery() {
   esac
 
   server_host="$(parse_discovery_record_field "${record}" "server_host")"
-  server_port="$(parse_discovery_record_field "${record}" "server_port")"
+  server_address="$(parse_discovery_record_address "${record}")"
+  server_port="$(parse_discovery_record_service_port "${record}")"
   [[ -n "${server_host}" && -n "${server_port}" ]] || \
     err "Discovered cluster advertisement is missing server metadata."
 
-  CLUSTER_SERVER="https://${server_host}:${server_port}"
+  if [[ -n "${server_address}" ]]; then
+    CLUSTER_SERVER="https://${server_address}:${server_port}"
+  else
+    CLUSTER_SERVER="https://${server_host}:${server_port}"
+  fi
 
   case "${discovery_state}" in
     open)
