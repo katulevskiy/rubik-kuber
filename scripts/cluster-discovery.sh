@@ -403,6 +403,7 @@ advertise_service() {
     return 1
   fi
 
+  chmod 644 "${tmp_output}"
   mv "${tmp_output}" "${output_path}"
   printf '%s\n' "${output_path}"
 }
