@@ -43,6 +43,18 @@ assert_contains 'run_shell_with_progress "Installing Helm"' "${install_source}" 
 assert_contains 'run_shell_with_progress "Downloading and installing RKE2' "${install_source}" \
   "installer should use progress wrappers for the RKE2 install"
 
+assert_contains 'parse_cli_args()' "${install_source}" \
+  "installer should define CLI parsing for retry mode"
+
+assert_contains 'RETRY_JOIN=0' "${install_source}" \
+  "installer should define retry mode state"
+
+assert_contains 'sudo ./install.sh --retry' "${readme_source}" \
+  "README should document retry recovery mode"
+
+assert_contains 'sudo ./install.sh --retry' "${instructions_source}" \
+  "INSTRUCTIONS should document retry recovery mode"
+
 assert_contains 'INSTALL_VERBOSE=1 sudo ./install.sh' "${readme_source}" \
   "README should document verbose installer mode"
 

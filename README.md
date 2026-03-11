@@ -166,7 +166,7 @@ discovery.
 
 | Variable | Default | Description |
 |---|---|---|
-| `CLUSTER_SERVER` | *(absent = auto-select mode)* | Manual join server override such as `https://<init-node-short-hostname>.local:9345` |
+| `CLUSTER_SERVER` | *(absent = auto-select mode)* | Manual join server override such as `https://<init-node-ip>:9345` |
 | `CLUSTER_TOKEN` | — | Manual join token override from the init node |
 | `CLUSTER_ROLE` | `agent` for joins | Join-role override: `agent` or `server` |
 | `METALLB_RANGE` | *(auto-derived when unset)* | Free IP range on your LAN |
@@ -187,14 +187,25 @@ sudo ./install.sh
 does not create a second cluster. The installer switches to local repair/reconcile
 mode, refreshes the node's local configuration, and re-installs the reconcile service.
 
-The control-plane endpoint is advertised as
-`<current-short-hostname>.local` on the init node, so later nodes do not need to
-hard-code a DHCP address. For example, a node whose short hostname is
-`rubikpi` would advertise `rubikpi.local`. If the init node IP changes, the
-reconcile flow updates the local RKE2 server address, re-publishes the LAN
-discovery record, and re-applies the cluster-facing bits that depend on the
-node IP. Re-running `sudo ./install.sh` is also a safe manual recovery step
-after network changes.
+For joined nodes, repair is IP-first: the installer re-checks LAN discovery and prefers
+the currently advertised server IP when refreshing `server:` in
+`/etc/rancher/rke2/config.yaml`. Hostnames such as `<short-hostname>.local` are kept as
+optional metadata, but cluster join and joined-node recovery do not depend on them.
+
+If the init node IP changes, the reconcile flow re-publishes the LAN discovery record,
+refreshes cluster-facing settings that depend on the server address, and standard
+`sudo ./install.sh` reruns on joined nodes will try to heal stale local join endpoints
+automatically.
+
+If a joined node is still stuck with bad local join state, force rediscovery with:
+
+```bash
+sudo ./install.sh --retry
+```
+
+`--retry` ignores the stored joined-node endpoint and requires a usable discovery target
+on the LAN. In `manual` discovery mode it fails closed and tells you to pass explicit
+`CLUSTER_SERVER` and `CLUSTER_TOKEN`.
 
 ---
 
@@ -208,9 +219,10 @@ Use this checklist when validating the auto-install / auto-rejoin flow:
 | Fresh first node, non-interactive open mode | `sudo AUTOJOIN_ADVERTISE_TOKEN=yes ./install.sh` | Boots without prompting for advertisement policy and publishes zero-config auto-join |
 | Fresh first node, non-interactive manual mode | `sudo AUTOJOIN_ADVERTISE_TOKEN=no ./install.sh` | Boots without prompting for advertisement policy and withholds the raw join token |
 | Fresh later node, zero-arg join | `sudo ./install.sh` | Discovers the cluster and joins automatically as an `agent` when the init node advertises `open` mode |
-| Fresh later node, manual fallback | `sudo CLUSTER_SERVER="https://<init-node-short-hostname>.local:9345" CLUSTER_TOKEN="<token>" ./install.sh` | Joins with explicit credentials even if discovery is unavailable or manual-only |
-| Existing node after network/IP change | `sudo ./install.sh` | Enters repair/reconcile mode and refreshes local config instead of bootstrapping a new cluster |
-| Control-plane IP change | `sudo ./install.sh` on the init node, then `sudo ./install.sh` on later nodes if needed | `<current-short-hostname>.local` discovery and cluster access recover without replacing the cluster |
+| Fresh later node, manual fallback | `sudo CLUSTER_SERVER="https://<init-node-ip>:9345" CLUSTER_TOKEN="<token>" ./install.sh` | Joins with explicit credentials even if discovery is unavailable or manual-only |
+| Existing node after network/IP change | `sudo ./install.sh` | Enters repair/reconcile mode, re-checks discovery, and refreshes local config instead of bootstrapping a new cluster |
+| Broken joined node with stale local endpoint | `sudo ./install.sh --retry` | Ignores stored joined-node endpoint state and forces rediscovery from current LAN metadata |
+| Control-plane IP change | `sudo ./install.sh` on the init node, then `sudo ./install.sh` on later nodes if needed | Discovery and joined-node repair recover against the currently advertised server IP without replacing the cluster |
 
 By default the installer shows concise step messages plus progress heartbeats for long-running operations. Use `INSTALL_VERBOSE=1 sudo ./install.sh` when you want the raw `apt`, `helm`, and `rke2` command output.
 

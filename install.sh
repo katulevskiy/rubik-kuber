@@ -16,6 +16,9 @@
 #          CLUSTER_ROLE=agent \
 #          ./install.sh
 #
+#   Recover a broken joined node by rediscovering the cluster:
+#     sudo ./install.sh --retry
+#
 # Environment variables:
 #   CLUSTER_SERVER           — manual join server override
 #   CLUSTER_TOKEN            — manual join token override
@@ -24,6 +27,8 @@
 #   AUTOJOIN_ADVERTISE_TOKEN — init-node discovery policy override ("yes" or "no")
 #   RANCHER_PASSWORD         — Rancher bootstrap password (default: rubikpi-admin)
 #   INSTALL_VERBOSE          — "1" = stream full command output during install
+# CLI flags:
+#   --retry                  — force joined-node rediscovery instead of trusting local join endpoint state
 
 set -euo pipefail
 
@@ -133,6 +138,8 @@ METALLB_RANGE="${METALLB_RANGE:-}"
 AUTOJOIN_ADVERTISE_TOKEN="${AUTOJOIN_ADVERTISE_TOKEN:-}"
 RANCHER_PASSWORD="${RANCHER_PASSWORD:-rubikpi-admin}"
 INSTALL_VERBOSE="${INSTALL_VERBOSE:-0}"
+RETRY_JOIN=0
+LAST_DISCOVERY_STATE=""
 
 APT_INSTALL_FLAGS=(-y -qq)
 APT_UPDATE_FLAGS=(-qq)
@@ -174,6 +181,29 @@ apt_remove_cmd() {
 
 apt_fix_cmd() {
   apt-get -f install "${APT_INSTALL_FLAGS[@]}"
+}
+
+parse_cli_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --retry)
+        RETRY_JOIN=1
+        shift
+        ;;
+      --help|-h)
+        cat <<'EOF'
+Usage: sudo ./install.sh [--retry]
+
+  --retry    Force joined-node rediscovery and refresh the local join endpoint
+             from LAN metadata instead of trusting the stored server address.
+EOF
+        exit 0
+        ;;
+      *)
+        err "Unknown argument: $1"
+        ;;
+    esac
+  done
 }
 
 require_root() {
@@ -391,7 +421,7 @@ discovered_join_candidate() {
   esac
 }
 
-load_autojoin_from_discovery() {
+try_load_autojoin_from_discovery() {
   local discovery_info=()
   local discovery_state=""
   local record=""
@@ -400,13 +430,61 @@ load_autojoin_from_discovery() {
   local server_port=""
   local token=""
 
+  LAST_DISCOVERY_STATE=""
+  AUTOJOIN_DISCOVERY_MODE=""
+
   mapfile -t discovery_info < <(inspect_discovery_candidate)
   discovery_state="${discovery_info[0]:-invalid}"
   record="${discovery_info[1]:-}"
+  LAST_DISCOVERY_STATE="${discovery_state}"
 
   case "${discovery_state}" in
     open|manual)
       ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  server_host="$(parse_discovery_record_field "${record}" "server_host")"
+  server_address="$(parse_discovery_record_address "${record}")"
+  server_port="$(parse_discovery_record_service_port "${record}")"
+
+  if [[ -z "${server_host}" || -z "${server_port}" ]]; then
+    LAST_DISCOVERY_STATE="invalid"
+    return 1
+  fi
+
+  if [[ -n "${server_address}" ]]; then
+    CLUSTER_SERVER="https://${server_address}:${server_port}"
+  else
+    CLUSTER_SERVER="https://${server_host}:${server_port}"
+  fi
+
+  case "${discovery_state}" in
+    open)
+      token="$(parse_discovery_record_field "${record}" "token")"
+      if [[ -z "${token}" ]]; then
+        LAST_DISCOVERY_STATE="invalid"
+        return 1
+      fi
+      CLUSTER_TOKEN="${token}"
+      ;;
+    manual)
+      CLUSTER_TOKEN=""
+      ;;
+  esac
+
+  AUTOJOIN_DISCOVERY_MODE="${discovery_state}"
+  return 0
+}
+
+load_autojoin_from_discovery() {
+  if try_load_autojoin_from_discovery; then
+    return 0
+  fi
+
+  case "${LAST_DISCOVERY_STATE:-invalid}" in
     multiple)
       err "Multiple cluster discovery candidates found on the LAN. Refusing to guess; re-run with CLUSTER_SERVER and CLUSTER_TOKEN."
       ;;
@@ -423,34 +501,9 @@ load_autojoin_from_discovery() {
       err "No cluster discovery candidate is currently visible on the LAN."
       ;;
     *)
-      err "Unsupported discovery state: ${discovery_state}"
+      err "Unsupported discovery state: ${LAST_DISCOVERY_STATE:-unknown}"
       ;;
   esac
-
-  server_host="$(parse_discovery_record_field "${record}" "server_host")"
-  server_address="$(parse_discovery_record_address "${record}")"
-  server_port="$(parse_discovery_record_service_port "${record}")"
-  [[ -n "${server_host}" && -n "${server_port}" ]] || \
-    err "Discovered cluster advertisement is missing server metadata."
-
-  if [[ -n "${server_address}" ]]; then
-    CLUSTER_SERVER="https://${server_address}:${server_port}"
-  else
-    CLUSTER_SERVER="https://${server_host}:${server_port}"
-  fi
-
-  case "${discovery_state}" in
-    open)
-      token="$(parse_discovery_record_field "${record}" "token")"
-      [[ -n "${token}" ]] || err "Discovered open-join advertisement is missing its token."
-      CLUSTER_TOKEN="${token}"
-      ;;
-    manual)
-      CLUSTER_TOKEN=""
-      ;;
-  esac
-
-  AUTOJOIN_DISCOVERY_MODE="${discovery_state}"
 }
 
 read_persisted_autojoin_mode() {
@@ -1770,6 +1823,73 @@ EOF
   print_join_summary
 }
 
+resolve_joined_repair_target() {
+  local existing_server="$1"
+  local existing_token="$2"
+  local resolved_server="${existing_server}"
+  local resolved_token="${existing_token}"
+  local discovered_server=""
+  local discovered_token=""
+  local discovered_mode=""
+
+  CLUSTER_SERVER="${existing_server}"
+  CLUSTER_TOKEN="${existing_token}"
+  AUTOJOIN_DISCOVERY_MODE=""
+
+  if try_load_autojoin_from_discovery; then
+    discovered_server="${CLUSTER_SERVER}"
+    discovered_token="${CLUSTER_TOKEN}"
+    discovered_mode="${AUTOJOIN_DISCOVERY_MODE}"
+
+    case "${discovered_mode}" in
+      open)
+        resolved_server="${discovered_server}"
+        resolved_token="${discovered_token}"
+        if [[ "${resolved_server}" != "${existing_server}" || "${resolved_token}" != "${existing_token}" ]]; then
+          info "Refreshing joined-node endpoint from open LAN discovery: ${resolved_server}"
+        fi
+        ;;
+      manual)
+        if [[ "${RETRY_JOIN}" == "1" ]]; then
+          err "Retry requested, but the discovered cluster is advertising manual join mode. Re-run with CLUSTER_SERVER=\"${discovered_server}\" and CLUSTER_TOKEN=\"<token>\"."
+        fi
+        resolved_server="${discovered_server}"
+        resolved_token="${existing_token}"
+        if [[ "${resolved_server}" != "${existing_server}" ]]; then
+          info "Refreshing joined-node endpoint from manual LAN discovery: ${resolved_server}"
+        fi
+        ;;
+    esac
+  else
+    if [[ "${RETRY_JOIN}" == "1" ]]; then
+      case "${LAST_DISCOVERY_STATE:-invalid}" in
+        multiple)
+          err "Retry requested, but multiple cluster discovery candidates are visible on the LAN. Re-run with explicit CLUSTER_SERVER and CLUSTER_TOKEN."
+          ;;
+        invalid)
+          err "Retry requested, but the discovered cluster advertisement is malformed or incomplete. Fix discovery or re-run with explicit CLUSTER_SERVER and CLUSTER_TOKEN."
+          ;;
+        runtime-failure)
+          err "Retry requested, but cluster discovery browsing failed at runtime. Fix Avahi/discovery or re-run with explicit CLUSTER_SERVER and CLUSTER_TOKEN."
+          ;;
+        unavailable)
+          err "Retry requested, but the cluster discovery helper is unavailable. Re-run with explicit CLUSTER_SERVER and CLUSTER_TOKEN."
+          ;;
+        none)
+          err "Retry requested, but no cluster discovery candidate is currently visible on the LAN. Re-run with explicit CLUSTER_SERVER and CLUSTER_TOKEN."
+          ;;
+        *)
+          err "Retry requested, but no usable discovery target was found."
+          ;;
+      esac
+    fi
+    info "Discovery did not yield a usable joined-node repair target — preserving existing endpoint"
+  fi
+
+  CLUSTER_SERVER="${resolved_server}"
+  CLUSTER_TOKEN="${resolved_token}"
+}
+
 repair_joined_node() {
   [[ -n "${CLUSTER_SERVER}" ]] || err "Joined-node repair requires an existing server endpoint."
   [[ -n "${CLUSTER_TOKEN}" ]] || err "Joined-node repair requires an existing token."
@@ -1798,6 +1918,8 @@ tls-san:
 EOF
 
   install_rke2 "${rke2_type}"
+  run_with_progress "Restarting rke2-${rke2_type} to apply refreshed config" "Restarting rke2-${rke2_type}" \
+    systemctl restart "rke2-${rke2_type}"
   setup_kubectl
   install_cluster_discovery_runtime
   install_network_reconcile
@@ -1820,11 +1942,10 @@ install_repair() {
   existing_server="$(read_rke2_config_value server || true)"
 
   if [[ -n "${existing_server}" ]]; then
-    CLUSTER_SERVER="${existing_server}"
     existing_token="$(read_rke2_config_value token || true)"
     [[ -n "${existing_token}" ]] || err "Existing join config is missing token: ${RKE2_CONFIG_DIR}/config.yaml"
-    CLUSTER_TOKEN="${existing_token}"
     CLUSTER_ROLE="$(detect_local_join_role)"
+    resolve_joined_repair_target "${existing_server}" "${existing_token}"
     repair_joined_node
   else
     install_init "repair"
@@ -1941,6 +2062,7 @@ check_firmware() {
 main() {
   local install_mode
 
+  parse_cli_args "$@"
   require_root
 
   echo
@@ -1962,7 +2084,11 @@ main() {
       install_join
       ;;
     repair)
-      echo -e "  ${BOLD}Mode: REPAIR${NC} — reconciling existing local RKE2 install"
+      if [[ "${RETRY_JOIN}" == "1" ]]; then
+        echo -e "  ${BOLD}Mode: REPAIR+RETRY${NC} — rediscovering and reconciling existing local RKE2 install"
+      else
+        echo -e "  ${BOLD}Mode: REPAIR${NC} — reconciling existing local RKE2 install"
+      fi
       install_repair
       ;;
     auto-join-open)

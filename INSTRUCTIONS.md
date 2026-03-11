@@ -73,7 +73,7 @@ Manual join remains the fallback whenever discovery is unavailable, the init nod
 advertising `manual` mode, or the LAN has multiple visible clusters:
 
 ```bash
-sudo CLUSTER_SERVER="https://<init-node-short-hostname>.local:9345" \
+sudo CLUSTER_SERVER="https://<init-node-ip>:9345" \
      CLUSTER_TOKEN="<token>" \
      ./install.sh
 ```
@@ -97,12 +97,20 @@ sudo ./install.sh
 ```
 
 On an already-installed node, that enters repair/reconcile mode instead of creating a
-new cluster. The reconcile flow rechecks the local node IP, refreshes the advertised
-control-plane endpoint, and re-applies cluster-facing configuration that depends on the
-server address. The intended steady-state endpoint is
-`<current-short-hostname>.local`, so later nodes can keep joining or reconnecting
-without pinning a DHCP lease. For example, a node whose short hostname is `rubikpi`
-would advertise `rubikpi.local`.
+new cluster. For joined nodes, repair is IP-first: it re-checks LAN discovery and
+prefers the currently advertised server IP when refreshing the local `server:` value.
+Hostnames such as `<current-short-hostname>.local` are optional metadata, not a
+requirement for join or joined-node recovery.
+
+If the node is still stuck with bad local join state, force rediscovery with:
+
+```bash
+sudo ./install.sh --retry
+```
+
+`--retry` ignores the stored joined-node endpoint and requires a usable LAN discovery
+record. If the cluster advertises `manual` mode, it fails closed and tells you to pass
+explicit `CLUSTER_SERVER` and `CLUSTER_TOKEN`.
 
 ### Verification checklist
 
@@ -114,9 +122,10 @@ Use this checklist when validating the install flows:
 | Fresh init node, open advertisement | `sudo AUTOJOIN_ADVERTISE_TOKEN=yes ./install.sh` | Persists `open` mode and enables zero-config later-node joins |
 | Fresh init node, manual advertisement | `sudo AUTOJOIN_ADVERTISE_TOKEN=no ./install.sh` | Persists `manual` mode and requires explicit join credentials later |
 | Fresh later node, automatic join | `sudo ./install.sh` | Discovers the cluster and joins as an `agent` without manual env vars |
-| Fresh later node, explicit manual join | `sudo CLUSTER_SERVER="https://<init-node-short-hostname>.local:9345" CLUSTER_TOKEN="<token>" ./install.sh` | Joins even if discovery is unavailable or manual-only |
-| Existing node after DHCP or subnet changes | `sudo ./install.sh` | Repairs local config and re-runs reconcile logic instead of re-bootstrapping |
-| Control-plane address drift | verify `<current-short-hostname>.local` resolves to the init node, then re-run `sudo ./install.sh` as needed | Discovery and cluster access recover without rebuilding the cluster |
+| Fresh later node, explicit manual join | `sudo CLUSTER_SERVER="https://<init-node-ip>:9345" CLUSTER_TOKEN="<token>" ./install.sh` | Joins even if discovery is unavailable or manual-only |
+| Existing node after DHCP or subnet changes | `sudo ./install.sh` | Repairs local config, re-checks discovery, and re-runs reconcile logic instead of re-bootstrapping |
+| Broken joined node with stale local endpoint | `sudo ./install.sh --retry` | Forces rediscovery from current LAN metadata instead of trusting stored join endpoint state |
+| Control-plane address drift | re-run `sudo ./install.sh` as needed | Discovery and joined-node repair recover without rebuilding the cluster |
 
 By default the installer keeps output clean and emits heartbeat progress messages for long `apt`, `helm`, and `rke2` steps. Use `INSTALL_VERBOSE=1 sudo ./install.sh` if you want the full raw command output instead.
 
