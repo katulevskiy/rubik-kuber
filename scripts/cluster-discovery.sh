@@ -171,7 +171,13 @@ unique_discovery_records() {
   local records="${1:-}"
   local record=""
   local identity=""
+  local family=""
+  local score=0
+  local existing_score=0
+  local -a order=()
   declare -A seen=()
+  declare -A chosen_record=()
+  declare -A chosen_score=()
 
   [[ -n "${records}" ]] || return 1
 
@@ -180,11 +186,43 @@ unique_discovery_records() {
     [[ "${record%%;*}" == "=" ]] || continue
     identity="$(discovery_record_identity "${record}" || true)"
     [[ -n "${identity}" ]] || continue
+
+    family="$(printf '%s\n' "${record}" | awk -F';' '
+      $1 == "=" {
+        if ($8 == "IPv4" || $8 == "IPv6") {
+          print $8
+        } else {
+          print $3
+        }
+        exit
+      }
+    ')"
+
+    case "${family}" in
+      IPv4) score=2 ;;
+      IPv6) score=1 ;;
+      *) score=0 ;;
+    esac
+
     if [[ -z "${seen[${identity}]+x}" ]]; then
-      printf '%s\n' "${record}"
+      order+=("${identity}")
       seen["${identity}"]=1
+      chosen_record["${identity}"]="${record}"
+      chosen_score["${identity}"]="${score}"
+      continue
+    fi
+
+    existing_score="${chosen_score[${identity}]}"
+    if (( score > existing_score )); then
+      chosen_record["${identity}"]="${record}"
+      chosen_score["${identity}"]="${score}"
     fi
   done <<< "${records}"
+
+  local ordered_identity=""
+  for ordered_identity in "${order[@]}"; do
+    printf '%s\n' "${chosen_record[${ordered_identity}]}"
+  done
 }
 
 normalize_discovery_txt_entries() {

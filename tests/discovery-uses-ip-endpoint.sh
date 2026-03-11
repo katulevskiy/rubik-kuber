@@ -33,11 +33,21 @@ PY
 source_install_helpers
 
 record='=;eth0;IPv4;rubik-cluster;_rubik-k8s._tcp;local;rubikpi.local;192.168.0.223;9345;"cluster_name=rubik-cluster";"mode=open";"server_host=rubikpi.local";"server_port=9345";"token=test-token";"version=1"'
+record_with_proto='=;eth0;IPv4;rubik-cluster;_rubik-k8s._tcp;local;rubikpi.local;IPv4;192.168.0.223;9345;"cluster_name=rubik-cluster";"mode=open";"server_host=rubikpi.local";"server_port=9345";"token=test-token";"version=1"'
+ipv6_record='=;eth0;IPv6;rubik-cluster;_rubik-k8s._tcp;local;rubikpi.local;IPv6;fd01:9d35:9c2f:bb4a:bdfe:57c4:b88e:88b3;9345;"cluster_name=rubik-cluster";"mode=open";"server_host=rubikpi.local";"server_port=9345";"token=test-token";"version=1"'
 
 assert_eq "192.168.0.223" "$(parse_discovery_record_address "${record}")" \
   "discovery parser should read the resolved service IP from the Avahi record"
+assert_eq "192.168.0.223" "$(parse_discovery_record_address "${record_with_proto}")" \
+  "discovery parser should read the resolved service IP from Avahi records that include an address family column"
 assert_eq "9345" "$(parse_discovery_record_service_port "${record}")" \
   "discovery parser should read the service port from the Avahi record"
+assert_eq "9345" "$(parse_discovery_record_service_port "${record_with_proto}")" \
+  "discovery parser should read the service port from Avahi records that include an address family column"
+assert_eq "https://192.168.0.223:9345" "$(format_endpoint_url "192.168.0.223" "9345")" \
+  "IPv4 endpoints should not be bracketed"
+assert_eq "https://[fd01:9d35:9c2f:bb4a:bdfe:57c4:b88e:88b3]:9345" "$(format_endpoint_url "$(parse_discovery_record_address "${ipv6_record}")" "$(parse_discovery_record_service_port "${ipv6_record}")")" \
+  "IPv6 endpoints should be bracketed when formatted as URLs"
 
 inspect_discovery_candidate() {
   cat <<'EOF'

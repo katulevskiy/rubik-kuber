@@ -599,12 +599,32 @@ load_discovery_target() {
   declare -F discover_single_cluster >/dev/null 2>&1 || return 1
   declare -F extract_discovery_record_field >/dev/null 2>&1 || return 1
 
+  format_endpoint_url() {
+    local host="$1"
+    local port="$2"
+
+    if [[ "${host}" == *:* && "${host}" != \[*\] ]]; then
+      printf 'https://[%s]:%s\n' "${host}" "${port}"
+    else
+      printf 'https://%s:%s\n' "${host}" "${port}"
+    fi
+  }
+
   record=$(discover_single_cluster 2>/dev/null) || return 1
   [[ -n "${record}" ]] || return 1
 
   server_host=$(extract_discovery_record_field "${record}" "server_host" || true)
   server_port=$(extract_discovery_record_field "${record}" "server_port" || true)
-  server_address=$(printf '%s\n' "${record}" | awk -F';' '$1 == "=" { print $8; exit }')
+  server_address=$(printf '%s\n' "${record}" | awk -F';' '
+    $1 == "=" {
+      if ($8 == "IPv4" || $8 == "IPv6") {
+        print $9
+      } else {
+        print $8
+      }
+      exit
+    }
+  ')
   mode=$(extract_discovery_record_field "${record}" "mode" || true)
   token=$(extract_discovery_record_field "${record}" "token" || true)
 
@@ -624,9 +644,9 @@ load_discovery_target() {
 
   printf '%s\n' "${mode}"
   if [[ -n "${server_address}" ]]; then
-    printf 'https://%s:%s\n' "${server_address}" "${server_port}"
+    format_endpoint_url "${server_address}" "${server_port}"
   else
-    printf 'https://%s:%s\n' "${server_host}" "${server_port}"
+    format_endpoint_url "${server_host}" "${server_port}"
   fi
   printf '%s\n' "${token}"
 }

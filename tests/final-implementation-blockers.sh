@@ -67,6 +67,7 @@ EOF
 
   local record
   record="$(discover_single_cluster)"
+  assert_contains ";IPv4;192.168.1.10;9345;" "${record}" "deduped discovery should prefer the IPv4 record when dual-stack advertisements exist"
   assert_contains "server_host=rubikpi.local" "${record}" "deduped discovery should keep the shared service"
 }
 

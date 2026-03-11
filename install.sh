@@ -309,17 +309,46 @@ parse_discovery_record_field() {
 
 parse_discovery_record_address() {
   local record="$1"
-  printf '%s\n' "${record}" | awk -F';' '$1 == "=" { print $8; exit }'
+  printf '%s\n' "${record}" | awk -F';' '
+    $1 == "=" {
+      if ($8 == "IPv4" || $8 == "IPv6") {
+        print $9
+      } else {
+        print $8
+      }
+      exit
+    }
+  '
 }
 
 parse_discovery_record_service_port() {
   local record="$1"
   local field_port=""
-  field_port="$(printf '%s\n' "${record}" | awk -F';' '$1 == "=" { print $9; exit }')"
+  field_port="$(printf '%s\n' "${record}" | awk -F';' '
+    $1 == "=" {
+      if ($8 == "IPv4" || $8 == "IPv6") {
+        print $10
+      } else {
+        print $9
+      }
+      exit
+    }
+  ')"
   if [[ -n "${field_port}" ]]; then
     printf '%s\n' "${field_port}"
   else
     parse_discovery_record_field "${record}" "server_port"
+  fi
+}
+
+format_endpoint_url() {
+  local host="$1"
+  local port="$2"
+
+  if [[ "${host}" == *:* && "${host}" != \[*\] ]]; then
+    printf 'https://[%s]:%s\n' "${host}" "${port}"
+  else
+    printf 'https://%s:%s\n' "${host}" "${port}"
   fi
 }
 
@@ -456,9 +485,9 @@ try_load_autojoin_from_discovery() {
   fi
 
   if [[ -n "${server_address}" ]]; then
-    CLUSTER_SERVER="https://${server_address}:${server_port}"
+    CLUSTER_SERVER="$(format_endpoint_url "${server_address}" "${server_port}")"
   else
-    CLUSTER_SERVER="https://${server_host}:${server_port}"
+    CLUSTER_SERVER="$(format_endpoint_url "${server_host}" "${server_port}")"
   fi
 
   case "${discovery_state}" in
