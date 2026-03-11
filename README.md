@@ -1,5 +1,18 @@
 # Rubik Pi 3 — Kubernetes Cluster (RKE2)
 
+## TLDR
+
+On each qcom rubik pi 3,
+```
+git clone https://github.com/katulevskiy/rubik-kuber.git
+cd rubik-kuber
+sudo ./install.sh
+```
+
+Wait for the first node install to finish before you launch the next ones. Next ones can be installed in parallel.
+
+## Read this if you actually want to know what you're doing
+
 One-script RKE2 Kubernetes setup for one or many **Qualcomm Rubik Pi 3** devices
 (QCS6490 SoC). Run the same script on every Pi — it figures out whether to bootstrap
 a new cluster or join an existing one.
