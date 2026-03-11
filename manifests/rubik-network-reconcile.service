@@ -16,8 +16,8 @@ ExecStart=/usr/local/bin/rubik-network-reconcile
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=rubik-net-reconcile
-# Give it up to 10 minutes (cluster-reset + API wait + Helm upgrade)
-TimeoutStartSec=600
+# Give it up to 20 minutes (cluster-reset + API wait + Helm upgrade)
+TimeoutStartSec=1200
 
 [Install]
 WantedBy=multi-user.target

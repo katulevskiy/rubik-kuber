@@ -64,6 +64,15 @@ suggest_metallb_range() {
   echo "${prefix}.200-${prefix}.220"
 }
 
+# Returns the /24 prefix of an IP ("192.168.0")
+ip_prefix() { echo "$1" | cut -d. -f1-3; }
+
+# Returns the first IP in the current MetalLB pool (e.g. "192.168.70.200")
+current_metallb_ip() {
+  "${RKE2_KUBECTL}" get ipaddresspool rubikpi-pool -n metallb-system \
+    -o jsonpath='{.spec.addresses[0]}' 2>/dev/null | cut -d- -f1
+}
+
 generate_token() {
   if command -v openssl &>/dev/null; then
     openssl rand -hex 32
@@ -512,7 +521,34 @@ spec:
   ipAddressPools:
     - rubikpi-pool
 EOF
-  log "MetalLB pool configured"
+  log "MetalLB pool configured: ${range}"
+}
+
+update_metallb_pool() {
+  local range="$1"
+  info "Updating MetalLB IP pool to: ${range}"
+  "$RKE2_KUBECTL" patch ipaddresspool rubikpi-pool -n metallb-system --type='json' \
+    -p="[{\"op\":\"replace\",\"path\":\"/spec/addresses/0\",\"value\":\"${range}\"}]"
+  log "MetalLB pool updated"
+}
+
+# Remove any stale externalIPs from the traefik service so only MetalLB's
+# dynamically assigned IP is shown.
+clean_traefik_external_ips() {
+  local current_ext
+  current_ext=$("$RKE2_KUBECTL" get svc traefik -n traefik \
+    -o jsonpath='{.spec.externalIPs[*]}' 2>/dev/null || true)
+  if [[ -n "$current_ext" ]]; then
+    info "Removing stale externalIPs from traefik service: ${current_ext}"
+    "$RKE2_KUBECTL" get svc traefik -n traefik -o json | \
+      python3 -c "
+import json,sys
+svc=json.load(sys.stdin)
+svc['spec']['externalIPs']=[]
+svc['spec'].pop('loadBalancerIP',None)
+print(json.dumps(svc))
+" | "$RKE2_KUBECTL" apply -f - 2>/dev/null || true
+  fi
 }
 
 install_traefik() {
@@ -557,20 +593,17 @@ install_rancher() {
   step "Installing Rancher"
 
   # Get Traefik's LoadBalancer IP to construct the nip.io hostname.
-  # If already installed, read the persisted hostname instead of waiting again.
+  # Always re-derive from the live MetalLB-assigned IP so that if the subnet
+  # changed (and the pool was updated) the hostname stays correct.
   local rancher_hostname=""
-  if [[ -f "${RKE2_CONFIG_DIR}/rancher-hostname" ]]; then
-    rancher_hostname=$(cat "${RKE2_CONFIG_DIR}/rancher-hostname")
-    log "Using existing Rancher hostname: ${rancher_hostname}"
-  else
-    local traefik_ip
-    traefik_ip=$(wait_for_lb_ip traefik traefik) || {
-      warn "Could not obtain Traefik LoadBalancer IP — falling back to node IP"
-      traefik_ip="$node_ip"
-    }
-    rancher_hostname="rancher.${traefik_ip}.nip.io"
-    echo "$rancher_hostname" > "${RKE2_CONFIG_DIR}/rancher-hostname"
-  fi
+  local traefik_ip
+  traefik_ip=$(wait_for_lb_ip traefik traefik) || {
+    warn "Could not obtain Traefik LoadBalancer IP — falling back to node IP"
+    traefik_ip="$node_ip"
+  }
+  rancher_hostname="rancher.${traefik_ip}.nip.io"
+  # Cache for informational purposes; always recompute from live IP on next run.
+  echo "$rancher_hostname" > "${RKE2_CONFIG_DIR}/rancher-hostname"
 
   log "Rancher hostname: ${rancher_hostname}"
 
@@ -720,7 +753,7 @@ ExecStart=/usr/local/bin/rubik-network-reconcile
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=rubik-net-reconcile
-TimeoutStartSec=600
+TimeoutStartSec=1200
 
 [Install]
 WantedBy=multi-user.target
@@ -810,19 +843,29 @@ install_init() {
   node_ip=$(detect_node_ip) || err "Cannot detect node IP — is the network configured?"
   log "Node IP: ${node_ip}"
 
-  # Prompt for MetalLB range if not provided
+  # Derive MetalLB range automatically from the current node IP.
+  # Override with METALLB_RANGE env var if you need a specific range.
   if [[ -z "$METALLB_RANGE" ]]; then
-    local suggested
-    suggested=$(suggest_metallb_range "$node_ip")
-    echo
-    echo "MetalLB needs a range of free IP addresses on your local network."
-    echo "These IPs will be assigned to LoadBalancer services (Traefik, etc.)."
-    echo "They must NOT overlap with IPs assigned by your router's DHCP."
-    echo
-    read -rp "Enter MetalLB IP range [${suggested}]: " METALLB_RANGE
-    METALLB_RANGE="${METALLB_RANGE:-$suggested}"
+    METALLB_RANGE=$(suggest_metallb_range "$node_ip")
+    log "MetalLB IP range (auto-derived from node subnet): ${METALLB_RANGE}"
+  else
+    log "MetalLB IP range (from env): ${METALLB_RANGE}"
   fi
-  log "MetalLB IP range: ${METALLB_RANGE}"
+
+  # If MetalLB is already installed and its pool is in a different subnet,
+  # update the pool now so the LB IP follows the node to the new subnet.
+  if "$RKE2_KUBECTL" get ipaddresspool rubikpi-pool -n metallb-system &>/dev/null; then
+    local current_pool_ip
+    current_pool_ip=$(current_metallb_ip)
+    local current_prefix new_prefix
+    current_prefix=$(ip_prefix "$current_pool_ip")
+    new_prefix=$(ip_prefix "$(echo "$METALLB_RANGE" | cut -d- -f1)")
+    if [[ "$current_prefix" != "$new_prefix" ]]; then
+      warn "MetalLB pool subnet changed: ${current_prefix}.x → ${new_prefix}.x"
+      update_metallb_pool "$METALLB_RANGE"
+      clean_traefik_external_ips
+    fi
+  fi
 
   # Resolve token: use the running cluster's token if RKE2 is already up,
   # otherwise generate a fresh one. This ensures re-runs print the correct token.
@@ -849,6 +892,9 @@ install_init() {
       [[ -n "$existing_token" ]] && token="$existing_token"
     fi
     mkdir -p "$RKE2_CONFIG_DIR"
+    local _short_hn _fqdn
+    _short_hn=$(hostname -s 2>/dev/null || hostname)
+    _fqdn=$(hostname -f 2>/dev/null || hostname)
     cat > "${RKE2_CONFIG_DIR}/config.yaml" <<EOF
 # RKE2 init node — generated by rubik-kubernetes installer
 token: "${token}"
@@ -858,7 +904,9 @@ disable:
   - rke2-traefik
 tls-san:
   - "${node_ip}"
-  - "$(hostname -f 2>/dev/null || hostname)"
+  - "${_short_hn}"
+  - "${_short_hn}.local"
+  - "${_fqdn}"
 EOF
 
     # Detect if the node's IP has changed since the cluster was first
@@ -871,6 +919,9 @@ EOF
   else
     step "Writing RKE2 server config (init node)"
     mkdir -p "$RKE2_CONFIG_DIR"
+    local _short_hn _fqdn
+    _short_hn=$(hostname -s 2>/dev/null || hostname)
+    _fqdn=$(hostname -f 2>/dev/null || hostname)
     cat > "${RKE2_CONFIG_DIR}/config.yaml" <<EOF
 # RKE2 init node — generated by rubik-kubernetes installer
 token: "${token}"
@@ -880,7 +931,9 @@ disable:
   - rke2-traefik
 tls-san:
   - "${node_ip}"
-  - "$(hostname -f 2>/dev/null || hostname)"
+  - "${_short_hn}"
+  - "${_short_hn}.local"
+  - "${_fqdn}"
 EOF
   fi
 
@@ -929,6 +982,9 @@ install_join() {
   if ! systemctl is-active --quiet "rke2-${CLUSTER_ROLE}" 2>/dev/null; then
     step "Writing RKE2 ${CLUSTER_ROLE} config"
     mkdir -p "$RKE2_CONFIG_DIR"
+    local _short_hn _fqdn
+    _short_hn=$(hostname -s 2>/dev/null || hostname)
+    _fqdn=$(hostname -f 2>/dev/null || hostname)
     cat > "${RKE2_CONFIG_DIR}/config.yaml" <<EOF
 # RKE2 join node — generated by rubik-kubernetes installer
 server: "${CLUSTER_SERVER}"
@@ -936,7 +992,9 @@ token: "${CLUSTER_TOKEN}"
 write-kubeconfig-mode: "0640"
 tls-san:
   - "${node_ip}"
-  - "$(hostname -f 2>/dev/null || hostname)"
+  - "${_short_hn}"
+  - "${_short_hn}.local"
+  - "${_fqdn}"
 EOF
   else
     log "RKE2 already running — preserving existing config"
