@@ -13,3 +13,21 @@ clinfo | grep -E "Device Name|Max compute units"
 exit
 
 sudo ./scripts/session.sh stop $USER
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+rsync -av --exclude='.git/' --exclude='.worktrees/' ./ ubuntu@192.168.1.117:/home/ubuntu/rubik-kuber/
+
+953e42c8935919076283b22c6c16a1606f53279ac6c9b36aec016250bec3ac1e

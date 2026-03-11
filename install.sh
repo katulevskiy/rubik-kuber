@@ -1140,6 +1140,33 @@ apply_session_rbac() {
   fi
 }
 
+patch_coredns_for_session_taint() {
+  step "Patching CoreDNS for session-taint tolerance"
+
+  local deploy="rke2-coredns-rke2-coredns"
+  local namespace="kube-system"
+
+  if ! "$RKE2_KUBECTL" get deployment "$deploy" -n "$namespace" >/dev/null 2>&1; then
+    warn "CoreDNS deployment not found yet — skipping session-taint patch"
+    return 0
+  fi
+
+  local existing=""
+  existing=$("$RKE2_KUBECTL" get deployment "$deploy" -n "$namespace" \
+    -o jsonpath='{range .spec.template.spec.tolerations[*]}{.key}{"="}{.effect}{"\n"}{end}' 2>/dev/null || true)
+
+  if printf '%s\n' "$existing" | awk '$0 == "rubikpi.ai/exclusive-session=NoSchedule" { found=1 } END { exit(found ? 0 : 1) }'; then
+    log "CoreDNS already tolerates the session taint"
+    return 0
+  fi
+
+  "$RKE2_KUBECTL" patch deployment "$deploy" -n "$namespace" --type='json' -p='[
+    {"op":"add","path":"/spec/template/spec/tolerations/-","value":{"key":"rubikpi.ai/exclusive-session","operator":"Exists","effect":"NoSchedule"}}
+  ]' >/dev/null
+
+  log "CoreDNS patched to tolerate rubikpi.ai/exclusive-session"
+}
+
 # ── Network-reconcile service ──────────────────────────────────────────────────
 # Installs a lightweight systemd service that runs on every boot (after the
 # network comes up) to detect node IP changes and automatically:
@@ -1464,6 +1491,7 @@ EOF
   install_rancher "$node_ip"
   install_device_plugin
   apply_session_rbac
+  patch_coredns_for_session_taint
   label_node_cpu_topology
   install_network_reconcile
   install_cluster_discovery "${autojoin_mode}" "${token}"

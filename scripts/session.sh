@@ -134,6 +134,47 @@ untaint_node() {
   "$KUBECTL" taint node "$node" "${SESSION_TAINT_KEY}-" 2>/dev/null || true
 }
 
+session_taint_rows() {
+  "$KUBECTL" get nodes -o json 2>/dev/null | python3 -c '
+import json
+import sys
+
+key = sys.argv[1]
+doc = json.load(sys.stdin)
+for item in doc.get("items", []):
+    node = item.get("metadata", {}).get("name", "")
+    for taint in item.get("spec", {}).get("taints", []) or []:
+        if taint.get("key") == key:
+            print(f"{node}\t{taint.get(\"value\", \"\")}")
+' "$SESSION_TAINT_KEY"
+}
+
+# Remove stale exclusive-session taints left behind when a session pod was
+# deleted externally or a node rebooted before 'stop' ran.
+cleanup_orphan_session_taints() {
+  local tainted_nodes
+  tainted_nodes="$(session_taint_rows || true)"
+
+  [[ -n "$tainted_nodes" ]] || return 0
+
+  while IFS=$'\t' read -r node taint_val; do
+    [[ -n "$node" ]] || continue
+
+    local pod_exists=false
+    if [[ -n "$taint_val" ]]; then
+      local pod_check
+      pod_check=$(pod_name "$taint_val")
+      "$KUBECTL" get pod "$pod_check" -n "$NAMESPACE" &>/dev/null && pod_exists=true || true
+    fi
+
+    if [[ "$pod_exists" != "true" ]]; then
+      info "Removing orphaned exclusive-session taint from node '${node}'..."
+      untaint_node "$node"
+      log "Node '${node}' untainted (session '${taint_val:-unknown}' no longer exists)"
+    fi
+  done <<< "$tainted_nodes"
+}
+
 # Return the node a pod is running on, or empty string.
 pod_node() {
   local pod="$1"
@@ -157,6 +198,8 @@ cmd_start() {
   done
 
   [[ -n "$username" ]] || err "Usage: session.sh start <username> [--node <nodename>] [--cpu-type <type>]"
+
+  cleanup_orphan_session_taints
 
   local cpu_cores
   cpu_cores=$(cpu_type_to_cores "$cpu_type")
@@ -472,6 +515,8 @@ cmd_connect() {
 
 # ── list ───────────────────────────────────────────────────────────────────────
 cmd_list() {
+  cleanup_orphan_session_taints
+
   echo -e "${BOLD}Active sessions:${NC}"
   echo
 
@@ -646,9 +691,7 @@ cmd_untaint() {
 
   # Find all nodes with the session taint
   local tainted_nodes
-  tainted_nodes=$("$KUBECTL" get nodes \
-    -o jsonpath="{range .items[*]}{.metadata.name}{'\t'}{range .spec.taints[?(@.key==\"${SESSION_TAINT_KEY}\")]}{.value}{end}{'\n'}{end}" \
-    2>/dev/null | grep -v '^$' || true)
+  tainted_nodes="$(session_taint_rows || true)"
 
   if [[ -z "$tainted_nodes" ]]; then
     log "No nodes with session taints found."
