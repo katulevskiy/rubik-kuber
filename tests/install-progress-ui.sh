@@ -49,6 +49,12 @@ assert_contains 'parse_cli_args()' "${install_source}" \
 assert_contains 'RETRY_JOIN=0' "${install_source}" \
   "installer should define retry mode state"
 
+assert_contains 'NEEDRESTART_MODE=l apt-get install' "${install_source}" \
+  "installer should suppress needrestart auto-restarts during apt installs"
+
+assert_contains 'NEEDRESTART_MODE=l apt-get remove' "${install_source}" \
+  "installer should suppress needrestart auto-restarts during apt removals"
+
 assert_contains 'sudo ./install.sh --retry' "${readme_source}" \
   "README should document retry recovery mode"
 

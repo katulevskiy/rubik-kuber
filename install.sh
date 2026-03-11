@@ -172,15 +172,15 @@ apt_update_cmd() {
 }
 
 apt_install_cmd() {
-  apt-get install "${APT_INSTALL_FLAGS[@]}" "$@"
+  NEEDRESTART_MODE=l apt-get install "${APT_INSTALL_FLAGS[@]}" "$@"
 }
 
 apt_remove_cmd() {
-  apt-get remove "${APT_INSTALL_FLAGS[@]}" "$@"
+  NEEDRESTART_MODE=l apt-get remove "${APT_INSTALL_FLAGS[@]}" "$@"
 }
 
 apt_fix_cmd() {
-  apt-get -f install "${APT_INSTALL_FLAGS[@]}"
+  NEEDRESTART_MODE=l apt-get -f install "${APT_INSTALL_FLAGS[@]}"
 }
 
 parse_cli_args() {
